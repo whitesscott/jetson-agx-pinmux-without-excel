@@ -7,7 +7,7 @@ Download Jetson_Thor_Series_Modules_Pinmux_Template.xlsm from
 https://developer.nvidia.com/downloads/assets/embedded/secure/jetson/thor/docs/Jetson_Thor_Series_Modules_Pinmux_Template.xlsm
 ```
 
-# To enabling macros/vba in LibreOffice Calc for an .xls* files:
+### To enable macros/vba in LibreOffice Calc for an .xls* files:
 
 - Open **Jetson_Thor_Series_Modules_Pinmux_Template_v1.4.xlsm** with **LibreOffice Calc**.
 - Go to **Tools → Options** → **LibreOffice → Security** → click **Macro Security** → select the **Trusted Sources** tab.
