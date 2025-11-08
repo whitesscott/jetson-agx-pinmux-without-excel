@@ -2,16 +2,18 @@ A way to use Jetson Pinmux Template on Linux with out needing to use Microsoft E
 
 Download *.py
 
-Download Jetson_Thor_Series_Modules_Pinmux_Template.xlsm
+Download Jetson_Thor_Series_Modules_Pinmux_Template.xlsm from
 ```
 https://developer.nvidia.com/downloads/assets/embedded/secure/jetson/thor/docs/Jetson_Thor_Series_Modules_Pinmux_Template.xlsm
 ```
 
-Open Jetson_Thor_Series_Modules_Pinmux_Template_v1.4.xlsm with LibreOffice Calc
-A. Go to Tools/Options. click 'Macro Security'  click 'Trusted Sources' tab. 
-B. Under 'Trusted File Locations' 
-   'Add' the directory where you put Jetson_Thor_Series_Modules_Pinmux_Template_v1.4.xlsm
-C. Exit Calc.
+# To enabling macros/vba in LibreOffice Calc for an .xls* files:
+
+- Open **Jetson_Thor_Series_Modules_Pinmux_Template_v1.4.xlsm** with **LibreOffice Calc**.
+- Go to **Tools → Options** → **LibreOffice → Security** → click **Macro Security** → select the **Trusted Sources** tab.
+- Under **Trusted File Locations**, click **Add**, then select the directory where you saved `Jetson_Thor_Series_Modules_Pinmux_Template_v1.4.xlsm`.
+- Exit LibreOffice Calc.
+
 
 pip install pandas openpyxl
 
