@@ -247,7 +247,7 @@ def validate_pin_by_node(node_name: str):
 
     label = f"row {row} (Pin {pin_num or '?'}, {signal or '?'}, {mpio or '?'})"
     errs = []
-    warns = []
+    #warns = []
 
     # If tristate == ENABLE for this specific node, it's an error.
     if node_l == "extperiph2_clk_pk5" and tristate_macro == "TEGRA_PIN_ENABLE":
@@ -282,15 +282,11 @@ def validate_pin_by_node(node_name: str):
                 errs.append(
                     f"{label}: Allowed direction is OUTPUT-only, but Pin Direction is '{dir_raw}'."
                 )
-        elif allow == "bidir":
+        else allow == "bidir":
             if pin_dir not in ("none", "input", "output", "bidir"):
                 errs.append(
                     f"{label}: Allowed direction is BIDIRECTIONAL, but Pin Direction is '{dir_raw}'."
                 )
-        else:
-            warns.append(
-                f"{label}: Unrecognized Allowed Pin Direction code: '{allow_raw}'."
-            )
 
     # Wake rules
     if wake_on and not usage_l.startswith("unused_"):
@@ -300,7 +296,7 @@ def validate_pin_by_node(node_name: str):
                 "(only input/bidir pins should have wake)."
             )
 
-    return errs, warns
+    return errs
 
 
 if __name__ == "__main__":
@@ -311,7 +307,7 @@ if __name__ == "__main__":
     e, w = validate_pin_by_node(args.node)
     for x in e:
         print("[ERROR]", x)
-    for x in w:
-        print("[WARN ]", x)
-    if not e and not w:
+    #for x in w:
+        #print("[WARN ]", x)
+    if not e:
         print("OK.")

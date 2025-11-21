@@ -1,378 +1,475 @@
 #!/usr/bin/env python3
 """
-Generate pinmux DTS from Jetson Thor pinmux template (.xlsm/.xlsx).
+Generate DTS pinmux from Jetson Thor pinmux template (.xlsm/.xlsx).
 
-- Sheet: "Jetson Thor_DevKit"
-- Data rows: 13..479
-- Uses "Device Tree Pin Name" for node name + nvidia,pins (lowercase)
-- Uses "Customer Usage" (AS) for nvidia,function (lowercase)
-- Uses AS:BI customer config block for pull/tristate/enable-input/drive/lock/OD/DDC/EQOS
-- Emits pin comment: /* Pin <Pin #> - <Signal Name> */
-- NO validation, NO ERROR/WARN comments (safe for end users)
+Integrates logic inspired by generate_pinmux.py:
+
+1) String-based mappings for:
+   - PUPD        -> TEGRA_PIN_PULL_*
+   - Tristate    -> TEGRA_PIN_ENABLE / TEGRA_PIN_DISABLE
+   - E_Input     -> TEGRA_PIN_ENABLE / TEGRA_PIN_DISABLE
+   - DRV_TYPE    -> TEGRA_PIN_1X_DRIVER / TEGRA_PIN_2X_DRIVER /
+                    TEGRA_PIN_DEFAULT_DRIVE_1X / TEGRA_PIN_DEFAULT_DRIVE_2X
+
+2) Open-drain detection:
+   - If Pin Direction == "Open-Drain" OR E_IO_OD column is "ENABLE"
+     -> nvidia,open-drain = <TEGRA_PIN_ENABLE>;
+
+3) pinmux@ac281000 structure:
+   - / {
+         pinmux@ac281000 {
+             pinctrl-names = "default", "drive", "unused";
+             pinctrl-0 = <&pinmux_default>;
+             pinctrl-1 = <&drive_default>;
+             pinctrl-2 = <&pinmux_unused_lowpower>;
+
+             pinmux_default: common {
+                 ...
+             };
+
+             drive_default: drive { };
+             pinmux_unused_lowpower: unused_lowpower { };
+         };
+       };
+
+Sheet assumptions:
+- Sheet name: "Jetson Thor_DevKit" (configurable)
+- Header row contains: "Pin #", "Signal Name", "MPIO"
+- Row above header contains semantic titles like:
+    "Device Tree Pin Name", "PUPD", "Tristate", "E_Input",
+    "Customer Usage", "Pin Direction", "Req. Initial State",
+    "E_IO_OD...", "DRV_TYPE...", "E_LPBK...", "Lock", etc.
+
+Dependencies:
+    pip install openpyxl
 """
 
+from __future__ import annotations
+
 import argparse
-import re
-import xml.etree.ElementTree as ET
 from pathlib import Path
-import zipfile
+from typing import Dict, Tuple
 
-SHEET_NAME = "Jetson Thor_DevKit"
-ROW_DATA_START = 13
-ROW_DATA_END = 479
+from openpyxl import load_workbook
 
 
-# Column helpers
-def col_to_idx_1b(col_letters: str) -> int:
-    """Convert Excel letters (e.g. 'AS') to 1-based index."""
-    acc = 0
-    for ch in col_letters.strip().upper():
-        if "A" <= ch <= "Z":
-            acc = acc * 26 + (ord(ch) - ord("A") + 1)
-    return acc
-
-
-# Core identifying columns
-COL_A_PINNUM = col_to_idx_1b("A")  # Pin #
-COL_B_SIGNAL = col_to_idx_1b("B")  # Signal Name
-COL_C_MPIO   = col_to_idx_1b("C")  # MPIO (internal pin ID)
-
-# “Filled in by Customers” numeric/config block (AS..BI)
-ASSUME_FIELDS = {
-    "function"    : "AS",  # Customer Usage (we also use it as the function name)
-    "pull"        : "AT",
-    "tristate"    : "AU",
-    "enable-input": "AV",
-    "drv-type"    : "AX",
-    "lock"        : "BD",
-    "open-drain"  : "BE",
-    "ddc"         : "BF",
-    "rcvsel"      : "BG",
-    "has-eqos"    : "BH",
-    "eqos"        : "BI",
-}
-USED_COL_LETTERS = list(ASSUME_FIELDS.values())
-
-
-# XLSX/XLSM reader
-def _st(tag: str) -> str:
-    """Strip XML namespace from a tag."""
-    return tag.split("}", 1)[-1] if "}" in tag else tag
-
-
-def read_sheet_xml_and_shared(xlsx_path: Path):
-    """Open .xlsx/.xlsm and return (sheet_xml, shared_strings_list)."""
-    with zipfile.ZipFile(xlsx_path) as z:
-        # Map sheet name -> relId
-        wb_xml = ET.fromstring(z.read("xl/workbook.xml"))
-        name_to_rid = {}
-        for s in wb_xml.iter():
-            if _st(s.tag) == "sheet":
-                nm = s.attrib.get("name")
-                rid = s.attrib.get(
-                    "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
-                )
-                if nm and rid:
-                    name_to_rid[nm] = rid
-
-        if SHEET_NAME not in name_to_rid:
-            raise SystemExit(
-                f"Sheet '{SHEET_NAME}' not found. Available sheets: {list(name_to_rid.keys())}"
-            )
-
-        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
-        rid_to_target = {}
-        for r in rels.iter():
-            if _st(r.tag) == "Relationship":
-                rid_to_target[r.attrib["Id"]] = r.attrib["Target"]
-
-        target = rid_to_target[name_to_rid[SHEET_NAME]]  # e.g. "worksheets/sheet3.xml"
-        sheet_xml = ET.fromstring(z.read(f"xl/{target}"))
-
-        # shared strings
-        shared = []
-        if "xl/sharedStrings.xml" in z.namelist():
-            sst = ET.fromstring(z.read("xl/sharedStrings.xml"))
-            for si in sst.iter():
-                if _st(si.tag) == "si":
-                    parts = []
-                    for t in si.iter():
-                        if _st(t.tag) == "t" and t.text is not None:
-                            parts.append(t.text)
-                    shared.append("".join(parts))
-
-    return sheet_xml, shared
-
-
-def read_cells(sheet_xml, shared_strings,
-               row_min=None, row_max=None,
-               col_min=None, col_max=None,
-               col_filter_1b=None):
-    """
-    Read Excel cells into dict[(row, col_idx_1b)] = value (string or None).
-    - row_min / row_max: optional row bounds
-    - col_min / col_max: optional column index bounds
-    - col_filter_1b: optional set of column indices to include
-    """
-    vals = {}
-    for c in sheet_xml.iter():
-        if _st(c.tag) != "c":
-            continue
-        r = c.attrib.get("r")
-        if not r:
-            continue
-        m = re.match(r"([A-Z]+)(\d+)$", r)
-        if not m:
-            continue
-        col_letters, row_s = m.group(1), m.group(2)
-        row = int(row_s)
-        if row_min is not None and row < row_min:
-            continue
-        if row_max is not None and row > row_max:
-            continue
-        col_idx = col_to_idx_1b(col_letters)
-        if col_min is not None and col_idx < col_min:
-            continue
-        if col_max is not None and col_idx > col_max:
-            continue
-        if col_filter_1b is not None and col_idx not in col_filter_1b:
-            continue
-
-        t = c.attrib.get("t")
-        v_node = c.find("{*}v")
-        v = None
-        if v_node is not None and v_node.text is not None:
-            v = v_node.text
-            if t == "s":
-                try:
-                    v = shared_strings[int(v)]
-                except Exception:
-                    pass
-        else:
-            is_node = c.find("{*}is/{*}t")
-            if is_node is not None and is_node.text is not None:
-                v = is_node.text
-
-        vals[(row, col_idx)] = v
-    return vals
-
-
-# Helpers
-def as_int(v, default=0):
-    try:
-        if v is None or (isinstance(v, str) and v.strip() == ""):
-            return default
-        return int(float(str(v).strip()))
-    except Exception:
-        return default
-
-
-def as_boolish(v):
-    if v is None:
-        return False
-    s = str(v).strip().lower()
-    if s in ("1", "true", "yes", "y", "enable", "enabled"):
-        return True
-    if s in ("0", "false", "no", "n", "disable", "disabled", ""):
-        return False
-    try:
-        return float(s) != 0.0
-    except Exception:
-        return True
-
-
-def norm_text(v):
+# Normalization & mapping helpers
+def _norm_str(v) -> str:
     if v is None:
         return ""
     return str(v).strip()
 
 
-# Encoding helpers (map numbers to TEGRA_PIN_* macros)
-def encode_pull(val: int) -> str:
-    """Map numeric pull value to TEGRA_PIN_PULL_*."""
-    if val == 0:
-        return "TEGRA_PIN_PULL_NONE"
-    elif val == 1:
-        return "TEGRA_PIN_PULL_DOWN"
-    elif val == 2:
+def _norm_upper(v) -> str:
+    return _norm_str(v).upper()
+
+
+def map_pull(pupd: str) -> str:
+    """
+    Map PUPD column to TEGRA_PIN_PULL_* macros.
+
+    From generate_pinmux.py:
+      NORMAL    -> TEGRA_PIN_PULL_NONE
+      PULL_DOWN -> TEGRA_PIN_PULL_DOWN
+      PULL_UP   -> TEGRA_PIN_PULL_UP
+    """
+    v = _norm_upper(pupd)
+    if v == "PULL_UP":
         return "TEGRA_PIN_PULL_UP"
-    return str(val)
+    if v == "PULL_DOWN":
+        return "TEGRA_PIN_PULL_DOWN"
+    # "NORMAL", blank, etc.
+    return "TEGRA_PIN_PULL_NONE"
 
 
-def encode_tristate(val: int) -> str:
-    return "TEGRA_PIN_ENABLE" if val else "TEGRA_PIN_DISABLE"
-
-
-def encode_einput(val: int) -> str:
-    return "TEGRA_PIN_ENABLE" if val else "TEGRA_PIN_DISABLE"
-
-
-def encode_drvtype(val: int) -> str:
+def map_tristate(tristate: str) -> str:
     """
-    Map drive-strength encoding to TEGRA_PIN_* macros.
+    Thor sheet uses 'TRISTATE' / 'NORMAL' semantics.
+
+    generate_pinmux.py + VBA:
+      - TRISTATE string => bit=1 => TEGRA_PIN_ENABLE
+      - anything else   => bit=0 => TEGRA_PIN_DISABLE
     """
-    if val == 0:
-        return "TEGRA_PIN_1X_DRIVER"
-    elif val == 1:
+    v = _norm_upper(tristate)
+    if v == "TRISTATE":
+        return "TEGRA_PIN_ENABLE"
+    return "TEGRA_PIN_DISABLE"
+
+
+def map_e_input(einput: str) -> str:
+    """
+    E_Input column mapping.
+
+    generate_pinmux.py:
+      ENABLE  -> TEGRA_PIN_ENABLE
+      others  -> TEGRA_PIN_DISABLE
+    """
+    v = _norm_upper(einput)
+    if v == "ENABLE":
+        return "TEGRA_PIN_ENABLE"
+    return "TEGRA_PIN_DISABLE"
+
+
+def map_enable_disable(flag: str) -> str:
+    """
+    Generic Enable/Disable => TEGRA_PIN_ENABLE / TEGRA_PIN_DISABLE,
+    used for E_IO_OD, E_LPBK, Lock, etc.
+    """
+    v = _norm_upper(flag)
+    if v == "ENABLE":
+        return "TEGRA_PIN_ENABLE"
+    return "TEGRA_PIN_DISABLE"
+
+
+def map_drv_type(drv: str) -> str:
+    """
+    DRV_TYPE mapping based on generate_pinmux.py's get_drive_str():
+
+      ENABLE  -> TEGRA_PIN_2X_DRIVER
+      DEF_1X  -> TEGRA_PIN_DEFAULT_DRIVE_1X
+      DEF_2X  -> TEGRA_PIN_DEFAULT_DRIVE_2X
+      other   -> TEGRA_PIN_1X_DRIVER
+    """
+    v = _norm_upper(drv)
+    if v == "ENABLE":
         return "TEGRA_PIN_2X_DRIVER"
-    elif val == 2:
+    if v == "DEF_1X":
         return "TEGRA_PIN_DEFAULT_DRIVE_1X"
-    elif val == 3:
+    if v == "DEF_2X":
         return "TEGRA_PIN_DEFAULT_DRIVE_2X"
-    return "TEGRA_PIN_COMP"
+    return "TEGRA_PIN_1X_DRIVER"
 
 
-def encode_rcvsel(val: int) -> str:
-    return "TEGRA_PIN_ENABLE" if val else "TEGRA_PIN_DISABLE"
+def map_open_drain(pin_dir: str, od_flag: str) -> bool:
+    """
+    Open-drain detection inspired by generate_pinmux.py get_od_str:
+
+      - If Pin Direction is "OPEN-DRAIN"           -> Enable
+      - OR if OD/E_IO_OD column is "ENABLE"       -> Enable
+      - Else                                      -> Disable
+    """
+    pd = _norm_upper(pin_dir)
+    od = _norm_upper(od_flag)
+    if pd == "OPEN-DRAIN":
+        return True
+    if od == "ENABLE":
+        return True
+    return False
 
 
-def encode_eqos(val: int) -> str:
-    return "TEGRA_PIN_ENABLE" if val else "TEGRA_PIN_DISABLE"
+def _safe_function_name(usage: str, pin_group: str, usage_desc: str) -> str:
+    """
+    Decide between RSVDx and the "safe" function name, mimicking the
+    Excel/VBA behavior as closely as we can from the sheet:
+
+    - If Customer Usage starts with 'unused_'
+    - AND the description says 'UNUSED'
+    - AND Pin Group is RSVD0/RSVD1/RSVD2/RSVD3
+
+      => use rsvd0/rsvd1/rsvd2/rsvd3 (from Pin Group).
+
+    - Otherwise, use the Customer Usage string (lowercased), which is
+      how the Excel templates encode e.g. SHUTDOWN_N, etc.
+    """
+    u = _norm_str(usage)
+    u_l = u.lower()
+    pg = _norm_upper(pin_group)
+    desc = _norm_upper(usage_desc)
+
+    if u_l.startswith("unused_"):
+        if desc == "UNUSED" and pg.startswith("RSVD"):
+            # e.g. Pin Group "RSVD1" -> function "rsvd1"
+            return pg.lower()
+
+    # Default: keep the usage as the function, lowercased
+    return u_l
 
 
-# Main DTS generator
-def main():
-    ap = argparse.ArgumentParser(
-        description="Generate pinmux DTS from Jetson Thor pinmux template (no validation)."
-    )
-    ap.add_argument("workbook", help=".xlsm/.xlsx path")
-    ap.add_argument("-o", "--out", default="pinmux-thor.dtsi", help="Output DTS file")
-    args = ap.parse_args()
+# Header row discovery & column mapping
+def find_header_rows(ws) -> Tuple[int, int]:
+    """
+    Find:
+      - hdr_row: the row containing 'Pin #', 'Signal Name', 'MPIO'
+      - labels_row: the row just above hdr_row, containing semantic titles
+    """
+    max_row = ws.max_row
+    for r in range(1, max_row + 1):
+        a = _norm_str(ws.cell(row=r, column=1).value)
+        b = _norm_str(ws.cell(row=r, column=2).value)
+        c = _norm_str(ws.cell(row=r, column=3).value)
+        if a == "Pin #" and b == "Signal Name" and c == "MPIO":
+            hdr_row = r
+            labels_row = r - 1
+            if labels_row < 1:
+                raise RuntimeError(
+                    "Found 'Pin # / Signal Name / MPIO' at row 1; "
+                    "cannot locate labels row above."
+                )
+            return hdr_row, labels_row
 
-    xlsx = Path(args.workbook)
-    if not xlsx.exists():
-        raise SystemExit(f"File not found: {xlsx}")
+    raise RuntimeError("Could not find 'Pin # / Signal Name / MPIO' header row.")
 
-    sheet_xml, shared = read_sheet_xml_and_shared(xlsx)
 
-    # Discover "Device Tree Pin Name" column from header row (row 7)
-    header_cells = read_cells(sheet_xml, shared, row_min=7, row_max=7)
-    dt_col_idx = None
-    for (r, c), v in header_cells.items():
-        if isinstance(v, str) and v.strip() == "Device Tree Pin Name":
-            dt_col_idx = c
-            break
-    if dt_col_idx is None:
-        # Fallback to column U if header not found
-        dt_col_idx = col_to_idx_1b("U")
+def build_column_map(ws, labels_row: int) -> Dict[str, int]:
+    """
+    Build a semantic column map from the label row.
 
-    # Read Pin#, Signal, MPIO, Device Tree Pin Name, Customer Usage
-    pin_cols = {
-        COL_A_PINNUM,
-        COL_B_SIGNAL,
-        COL_C_MPIO,
-        dt_col_idx,
-        col_to_idx_1b("AS"),  # Customer Usage
-    }
+    Keys we care about:
+        pin_num      -> "Pin #"
+        signal_name  -> "Signal Name"
+        mpio         -> "MPIO"
+        dt_name      -> "Device Tree Pin Name"
+        pupd         -> "PUPD"
+        tristate     -> "Tristate"
+        einput       -> "E_Input"
+        drv_type     -> "DRV_TYPE..."
+        cust_usage   -> "Customer Usage"
+        pin_dir      -> "Pin Direction"
+        init_state   -> "Req. Initial State"
+        eio_od       -> "E_IO_OD..."
+        elpbk        -> "E_LPBK..."
+        lock         -> "Lock"
+        pin_group    -> "Pin Group" (for RSVD0/1/2/3 detection)
+        usage_desc   -> "Customer Usage Description or Net Names"
+    """
+    col_map: Dict[str, int] = {}
 
-    pin_cells = read_cells(
-        sheet_xml,
-        shared,
-        row_min=ROW_DATA_START,
-        row_max=ROW_DATA_END,
-        col_filter_1b=pin_cols,
-    )
+    max_col = ws.max_column
+    for c in range(1, max_col + 1):
+        title = ws.cell(row=labels_row, column=c).value
+        t = _norm_str(title)
 
-    # Read AS..BI customer config block
-    used_cols_1b = {col_to_idx_1b(c) for c in USED_COL_LETTERS}
-    used_cells = read_cells(
-        sheet_xml,
-        shared,
-        row_min=ROW_DATA_START,
-        row_max=ROW_DATA_END,
-        col_filter_1b=used_cols_1b,
-    )
+        if t == "Device Tree Pin Name":
+            col_map["dt_name"] = c
+        elif t == "Customer Usage":
+            col_map["cust_usage"] = c
+        elif t == "Pin Direction":
+            col_map["pin_dir"] = c
+        elif t == "Req. Initial State":
+            col_map["init_state"] = c
+        elif t == "Lock":
+            col_map["lock"] = c
+        elif t.startswith("E_IO_OD"):
+            col_map["eio_od"] = c
+        elif t.startswith("DRV_TYPE"):
+            col_map["drv_type"] = c
+        elif t.startswith("E_LPBK"):
+            col_map["elpbk"] = c
+        elif t == "PUPD":
+            col_map["pupd"] = c
+        elif t == "Tristate":
+            col_map["tristate"] = c
+        elif t == "E_Input":
+            col_map["einput"] = c
+        elif t == "Pin Group":
+            col_map["pin_group"] = c
+        elif t == "Customer Usage Description or Net Names":
+            col_map["usage_desc"] = c
 
-    def get_used(row, letter):
-        return used_cells.get((row, col_to_idx_1b(letter)))
+    # Pin # / Signal Name / MPIO come from the header row itself
+    col_map.setdefault("pin_num", 1)
+    col_map.setdefault("signal_name", 2)
+    col_map.setdefault("mpio", 3)
 
-    def get_dt_pin(row):
-        return pin_cells.get((row, dt_col_idx))
+    required = [
+        "dt_name",
+        "pupd",
+        "tristate",
+        "einput",
+        "cust_usage",
+        "pin_dir",
+        "init_state",
+        "lock",
+        "eio_od",
+        "drv_type",
+        "elpbk",
+    ]
+    missing = [k for k in required if k not in col_map]
+    if missing:
+        raise RuntimeError(
+            f"Missing required columns in labels row {labels_row}: {missing}"
+        )
 
-    TAB = "\t"
-    T2, T3, T4 = TAB * 2, TAB * 3, TAB * 4
-    lines: list[str] = []
+    return col_map
 
-    lines.append(f"{T2}common {{")
-    lines.append(f"{T3}/* SFIO/GPIO Pin Configuration (Jetson Thor, AS:BI + Device Tree Pin Name) */")
+
+# DTS generation
+def generate_pinmux(ws, hdr_row: int, labels_row: int) -> str:
+    """
+    Generate full DTS text containing:
+
+        / {
+            pinmux@ac281000 {
+                pinctrl-names = "default", "drive", "unused";
+                pinctrl-0 = <&pinmux_default>;
+                pinctrl-1 = <&drive_default>;
+                pinctrl-2 = <&pinmux_unused_lowpower>;
+
+                pinmux_default: common {
+                    ... all pins ...
+                };
+
+                drive_default: drive { };
+                pinmux_unused_lowpower: unused_lowpower { };
+            };
+        };
+
+    Returns: (dts_text, emitted_count)
+    """
+    col = build_column_map(ws, labels_row)
+
+    first_data_row = hdr_row + 1
+    last_row = ws.max_row
+
+    lines = []
+
+    # Excel-like includes at top
+    lines.append('/* Auto-generated from Jetson Thor pinmux spreadsheet */')
+    lines.append('#include "t264-pinctrl-tegra.h"')
+    # Many reference DTS also include a gpio dtsi here; keep this generic.
+    lines.append('#include "tegra264-gpio.h"')
+    lines.append("")
+    lines.append("/ {")
+    lines.append("\tpinmux@ac281000 {")
+    lines.append('\t\tpinctrl-names = "default", "drive", "unused";')
+    lines.append("\t\tpinctrl-0 = <&pinmux_default>;")
+    lines.append("\t\tpinctrl-1 = <&drive_default>;")
+    lines.append("\t\tpinctrl-2 = <&pinmux_unused_lowpower>;")
+    lines.append("")
+    lines.append("\t\tpinmux_default: common {")
+    lines.append("\t\t\t/* SFIO + GPIO Pin Configuration (auto-generated) */")
 
     emitted = 0
 
-    for r in range(ROW_DATA_START, ROW_DATA_END + 1):
-        pin_num = pin_cells.get((r, COL_A_PINNUM))
-        signal  = pin_cells.get((r, COL_B_SIGNAL))
-        mpio    = pin_cells.get((r, COL_C_MPIO))
-        dt_pin  = get_dt_pin(r)
-
-        pin = (dt_pin or mpio or "").strip()
-        if not pin:
+    for r in range(first_data_row, last_row + 1):
+        dt_name = _norm_str(ws.cell(row=r, column=col["dt_name"]).value)
+        if not dt_name:
             continue
 
-        usage_raw = pin_cells.get((r, col_to_idx_1b("AS")))
-        usage     = norm_text(usage_raw)
-        if not usage:
-            # blank "Customer Usage" → skip row
+        # Skip power-rail rows (e.g. VDDIO_SYS)
+        if dt_name.upper().startswith("VDDIO_"):
             continue
 
-        # Lowercase node name & function in DTS
-        pin_l = pin.lower()
-        func_l = usage.lower()
+        pin_num = _norm_str(ws.cell(row=r, column=col["pin_num"]).value)
+        signal_name = _norm_str(ws.cell(row=r, column=col["signal_name"]).value)
+        mpio = _norm_str(ws.cell(row=r, column=col["mpio"]).value)
+        usage = _norm_str(ws.cell(row=r, column=col["cust_usage"]).value)
+        pin_dir = _norm_str(ws.cell(row=r, column=col["pin_dir"]).value)
+        pupd = _norm_str(ws.cell(row=r, column=col["pupd"]).value)
+        tristate = _norm_str(ws.cell(row=r, column=col["tristate"]).value)
+        einput = _norm_str(ws.cell(row=r, column=col["einput"]).value)
+        drv = _norm_str(ws.cell(row=r, column=col["drv_type"]).value)
+        lock = _norm_str(ws.cell(row=r, column=col["lock"]).value)
+        eio_od = _norm_str(ws.cell(row=r, column=col["eio_od"]).value)
+        elpbk = _norm_str(ws.cell(row=r, column=col["elpbk"]).value)
 
-        # Numeric config from AS..BI
-        pull_val = as_int(get_used(r, ASSUME_FIELDS["pull"]), 0)
-        tri_val  = as_int(get_used(r, ASSUME_FIELDS["tristate"]), 0)
-        ein_val  = as_int(get_used(r, ASSUME_FIELDS["enable-input"]), 0)
-        drv_val  = as_int(get_used(r, ASSUME_FIELDS["drv-type"]), 0)
+        # Optional columns for RSVD logic
+        pin_group = ""
+        if "pin_group" in col:
+            pin_group = _norm_str(ws.cell(row=r, column=col["pin_group"]).value)
+        usage_desc = ""
+        if "usage_desc" in col:
+            usage_desc = _norm_str(ws.cell(row=r, column=col["usage_desc"]).value)
 
-        lock_en = as_boolish(get_used(r, ASSUME_FIELDS["lock"]))
-        od_en   = as_boolish(get_used(r, ASSUME_FIELDS["open-drain"]))
-        ddc_en  = as_boolish(get_used(r, ASSUME_FIELDS["ddc"]))
-        rcvsel_val = as_int(get_used(r, ASSUME_FIELDS["rcvsel"]), 0)
-        haseqos = as_boolish(get_used(r, ASSUME_FIELDS["has-eqos"]))
-        eqos_val = as_int(get_used(r, ASSUME_FIELDS["eqos"]), 0)
+        # Map to macros using string-based helpers
+        pull_macro = map_pull(pupd)
+        tristate_macro = map_tristate(tristate)
+        einput_macro = map_e_input(einput)
+        drv_macro = map_drv_type(drv)
+        lock_macro = map_enable_disable(lock)
+        eio_macro = map_enable_disable(eio_od)
+        elpbk_macro = map_enable_disable(elpbk)
 
-        pull_macro     = encode_pull(pull_val)
-        tristate_macro = encode_tristate(tri_val)
-        einput_macro   = encode_einput(ein_val)
-        drv_macro      = encode_drvtype(drv_val)
-        rcvsel_macro   = encode_rcvsel(rcvsel_val) if ddc_en else None
-        eqos_macro     = encode_eqos(eqos_val) if haseqos else None
+        # Open-drain detection from both Pin Direction + E_IO_OD
+        od_enabled = map_open_drain(pin_dir, eio_od)
 
-        # --- Emit DTS block ---
-        if pin_num or signal:
-            lines.append(f"{T3}/* Pin {pin_num or '?'} - {signal or '?'} */")
+        # Node name / pins string: lowercased DT pin name
+        node_name = dt_name.lower()
+        pins_str = dt_name.lower()
 
-        lines.append(f"{T3}{pin_l} {{")
-        lines.append(f'{T4}nvidia,pins = "{pin_l}";')
-        lines.append(f'{T4}nvidia,function = "{func_l}";')
-        lines.append(f"{T4}nvidia,pull = <{pull_macro}>;")
-        lines.append(f"{T4}nvidia,tristate = <{tristate_macro}>;")
-        lines.append(f"{T4}nvidia,enable-input = <{einput_macro}>;")
-        lines.append(f"{T4}nvidia,drv-type = <{drv_macro}>;")
-        if lock_en:
-            lines.append(f"{T4}nvidia,lock = <TEGRA_PIN_ENABLE>;")
-        if od_en:
-            lines.append(f"{T4}nvidia,open-drain = <TEGRA_PIN_ENABLE>;")
-        if ddc_en and rcvsel_macro is not None:
-            lines.append(f"{T4}nvidia,e-io-od = <{rcvsel_macro}>;")
-        if haseqos and eqos_macro is not None:
-            lines.append(f"{T4}nvidia,e-lpbk = <{eqos_macro}>;")
-        lines.append(f"{T3}}};")
+        # Function: use SafeFunctionName-style logic
+        func_name = _safe_function_name(usage, pin_group, usage_desc)
+
+        # Comment "Pin H53 - MCLK03"
+        if pin_num or signal_name:
+            comment = f"/* Pin {pin_num or '?'} - {signal_name or '?'} ({mpio or ''}) */"
+            lines.append(f"\t\t\t{comment}")
+
+        lines.append(f"\t\t\t{node_name} {{")
+        lines.append(f'\t\t\t\tnvidia,pins = "{pins_str}";')
+
+        if func_name:
+            lines.append(f'\t\t\t\tnvidia,function = "{func_name}";')
+
+        lines.append(f"\t\t\t\tnvidia,pull = <{pull_macro}>;")
+        lines.append(f"\t\t\t\tnvidia,tristate = <{tristate_macro}>;")
+        lines.append(f"\t\t\t\tnvidia,enable-input = <{einput_macro}>;")
+        lines.append(f"\t\t\t\tnvidia,drv-type = <{drv_macro}>;")
+
+        # Excel-style: always emit e-io-od and e-lpbk
+        lines.append(f"\t\t\t\tnvidia,e-io-od = <{eio_macro}>;")
+        lines.append(f"\t\t\t\tnvidia,e-lpbk = <{elpbk_macro}>;")
+
+        # Lock only when ENABLE
+        if lock_macro == "TEGRA_PIN_ENABLE":
+            lines.append("\t\t\t\tnvidia,lock = <TEGRA_PIN_ENABLE>;")
+
+        # Open-drain property
+        if od_enabled:
+            lines.append("\t\t\t\tnvidia,open-drain = <TEGRA_PIN_ENABLE>;")
+
+        lines.append("\t\t\t};")
         emitted += 1
 
-    # Footer blocks (kept minimal)
-    lines.append(f"{T2}}};")
+    # Close pinmux_default
+    lines.append("\t\t};")
+
+    # Keep placeholders for drive_default and pinmux_unused_lowpower
     lines.append("")
-    lines.append(f"{T2}pinmux_unused_lowpower: unused_lowpower {{")
-    lines.append(f"{T2}}};")
+    lines.append("\t\tdrive_default: drive {")
+    lines.append("\t\t};")
     lines.append("")
-    lines.append(f"{T2}drive_default: drive {{")
-    lines.append(f"{T2}}};")
+    lines.append("\t\tpinmux_unused_lowpower: unused_lowpower {")
+    lines.append("\t\t};")
+    lines.append("\t};")   # end pinmux@ac281000
+    lines.append("};")     # end / { }
+
+    return "\n".join(lines), emitted
+
+
+# CLI
+def main():
+    ap = argparse.ArgumentParser(
+        description="Generate Jetson Thor pinmux DTS from .xlsm/.xlsx (Excel-style)."
+    )
+    ap.add_argument("excel", help="Input .xlsm/.xlsx file (Thor pinmux template)")
+    ap.add_argument(
+        "-s",
+        "--sheet",
+        default="Jetson Thor_DevKit",
+        help="Worksheet name (default: 'Jetson Thor_DevKit')",
+    )
+    ap.add_argument(
+        "-o",
+        "--out",
+        default="pinmux-thor.dtsi",
+        help="Output DTS filename (default: pinmux-thor.dtsi)",
+    )
+    args = ap.parse_args()
+
+    wb = load_workbook(args.excel, data_only=True)
+    if args.sheet in wb.sheetnames:
+        ws = wb[args.sheet]
+    else:
+        ws = wb[wb.sheetnames[0]]
+
+    hdr_row, labels_row = find_header_rows(ws)
+    dts_text, count = generate_pinmux(ws, hdr_row, labels_row)
 
     out_path = Path(args.out)
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out_path.write_text(dts_text, encoding="utf-8")
+    print(f"Wrote {out_path} with {count} pin blocks.")
 
-    print(f"Wrote {out_path} with {emitted} pin blocks.")
 
 if __name__ == "__main__":
     main()

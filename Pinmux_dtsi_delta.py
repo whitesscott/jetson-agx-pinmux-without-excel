@@ -6,7 +6,22 @@ in the `common { ... }` section between BEFORE and AFTER DTS/DTSI files.
 Designed to work with output from gen_pinmux_dt_from_xlsx.py (clean),
 and to annotate *only the changed pins* with validator comments from
 pinmux_validator.validate_pin_by_node().
+
+Now also preserves the "header" from the AFTER file:
+  - Top comment (/* Auto-generated ... */)
+  - #include "t264-pinctrl-tegra.h"
+  - #include "tegra264-gpio.h"
+
+And wraps the delta `common { ... }` inside:
+
+    pinmux@ac281000 {
+        common {
+            ...
+        };
+    };
 """
+
+from __future__ import annotations
 
 import re
 import argparse
@@ -19,6 +34,7 @@ except Exception:
 
 TAB = "\t"
 T2, T3, T4 = TAB * 2, TAB * 3, TAB * 4
+
 
 # Helpers to isolate the `common { ... }` section
 def extract_common_body(text: str) -> str:
@@ -44,7 +60,6 @@ def extract_common_body(text: str) -> str:
     return ""
 
 
-# Parse pin blocks (with comments) inside common{}
 def parse_pin_blocks_with_comments(body: str):
     """
     Parse the `common { ... }` body into blocks keyed by pin/node name.
@@ -107,6 +122,72 @@ def parse_pin_blocks_with_comments(body: str):
     return blocks
 
 
+# Header extraction
+def extract_header(text: str) -> str:
+    """
+    Extract a simple "header" from the top of the AFTER file:
+      - Optional leading blank lines
+      - Top comment (/* ... */)
+      - Any #include lines
+    Stops as soon as it hits a non-comment, non-include, non-blank line.
+
+    This matches BEFORE/AFTER style, :
+
+        /* Auto-generated from Jetson Thor pinmux spreadsheet */
+        #include "t264-pinctrl-tegra.h"
+        #include "tegra264-gpio.h"
+    """
+    lines = text.splitlines()
+    header_lines = []
+    in_block_comment = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped == "":
+            # Preserve leading blank lines until we see real content
+            if not header_lines:
+                header_lines.append(line)
+                continue
+            # If we've already collected something (comment/includes), keep one more blank
+            header_lines.append(line)
+            continue
+
+        # Block comments (/* ... */), only at top
+        if stripped.startswith("/*"):
+            header_lines.append(line)
+            if not stripped.endswith("*/"):
+                in_block_comment = True
+            continue
+
+        if in_block_comment:
+            header_lines.append(line)
+            if "*/" in stripped:
+                in_block_comment = False
+            continue
+
+        # Single-line comment starting with //
+        if stripped.startswith("//"):
+            header_lines.append(line)
+            continue
+
+        # Includes
+        if stripped.startswith("#include"):
+            header_lines.append(line)
+            continue
+
+        # First "real" line reached -> stop
+        break
+
+    # Trim trailing blank lines from header if any
+    while header_lines and header_lines[-1].strip() == "":
+        header_lines.pop()
+
+    if header_lines:
+        return "\n".join(header_lines) + "\n\n"
+    return ""
+
+
 # Delta builder
 def build_delta_common(before_text: str, after_text: str) -> str:
     """
@@ -144,7 +225,6 @@ def build_delta_common(before_text: str, after_text: str) -> str:
 
     lines = []
     lines.append(f"{T2}common {{")
-    lines.append(f"{T3}/* Only pins that changed vs BEFORE */")
 
     for pin in sorted(changed_pins):
         full_text, _norm = after_blocks[pin]
@@ -155,11 +235,11 @@ def build_delta_common(before_text: str, after_text: str) -> str:
                 errs, warns = validate_pin_by_node(pin)
             except Exception as e:
                 errs = [f"Validator exception for node '{pin}': {e!r}"]
-                warns = []
             for e in errs:
                 lines.append(f"{T3}/* ERROR: {e} */")
-            for w in warns:
-                lines.append(f"{T3}/* WARN:  {w} */")
+            # If you want WARNs too, uncomment:
+            # for w in warns:
+            #     lines.append(f"{T3}/* WARN:  {w} */")
 
         # Then append the full AFTER block (comments + body) as-is
         lines.append(full_text)
@@ -175,20 +255,30 @@ def main():
     )
     ap.add_argument("before", help="BEFORE DTS/DTSI file")
     ap.add_argument("after", help="AFTER DTS/DTSI file")
-    ap.add_argument("-o", "--out", default="pinmux-thor-DELTA.dtsi", help="Output DTSI file")
+    ap.add_argument(
+        "-o",
+        "--out",
+        default="pinmux-thor-DELTA.dtsi",
+        help="Output DTSI file",
+    )
     args = ap.parse_args()
 
     before_text = Path(args.before).read_text(encoding="utf-8")
-    after_text  = Path(args.after).read_text(encoding="utf-8")
+    after_text = Path(args.after).read_text(encoding="utf-8")
 
+    header = extract_header(after_text)
     delta_common = build_delta_common(before_text, after_text)
 
     out_path = Path(args.out)
-    out_path.write_text(delta_common, encoding="utf-8")
 
     if delta_common.strip():
+        # Wrap the delta common{} in pinmux@ac281000 { ... };
+        body = "pinmux@ac281000 {\n" + delta_common + "};\n"
+        out_text = header + body
+        out_path.write_text(out_text, encoding="utf-8")
         print(f"Wrote {out_path}")
     else:
+        out_path.write_text("", encoding="utf-8")
         print("No pinmux differences detected (no changes to common{} pin blocks).")
 
 
