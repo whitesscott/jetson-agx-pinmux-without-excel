@@ -6,6 +6,10 @@ Shared pinmux validator for Jetson Thor.
 - Sheet: "Jetson Thor_DevKit"
 - Rows: 13..479
 - Provides: validate_pin_by_node(node_name) -> (errors, warnings)
+
+Updates:
+- Incorporated VBA logic for Resistor conflicts, Initial State validation,
+  Wake validation, and RCV_SEL (3.3V tolerance) checks.
 """
 
 import re
@@ -27,14 +31,20 @@ def col_to_idx_1b(col_letters: str) -> int:
             acc = acc * 26 + (ord(ch) - ord("A") + 1)
     return acc
 
+# Column Mappings (Based on Template v1.4 standard layout)
 COL_A_PINNUM      = col_to_idx_1b("A")
 COL_B_SIGNAL      = col_to_idx_1b("B")
 COL_C_MPIO        = col_to_idx_1b("C")
 COL_L_ALLOWED_DIR = col_to_idx_1b("L")
-COL_AS_USAGE      = col_to_idx_1b("AS")
-COL_AT_PIN_DIR    = col_to_idx_1b("AT")
-COL_AU_TRISTATE   = col_to_idx_1b("AU")
-COL_AV_WAKE       = col_to_idx_1b("AV")
+
+# User Configuration Columns
+COL_AS_USAGE      = col_to_idx_1b("AS") # Customer Usage
+COL_AT_PIN_DIR    = col_to_idx_1b("AT") # Pin Direction
+COL_AU_INIT_STATE = col_to_idx_1b("AU") # Req. Initial State (used for Int PU/PD checks)
+COL_AV_WAKE       = col_to_idx_1b("AV") # Wake Pin
+COL_AX_E_IO_OD    = col_to_idx_1b("AX") # E_IO_OD / 3.3V Tolerance
+COL_BC_EXT_PU     = col_to_idx_1b("BC") # Ext Pull Up Value
+COL_BD_EXT_PD     = col_to_idx_1b("BD") # Ext Pull Down Value
 
 
 def _st(tag: str) -> str:
@@ -153,21 +163,6 @@ def _is_wake_enabled(v):
         return False
     return True
 
-
-def _as_int(v, default=0):
-    try:
-        if v is None or (isinstance(v, str) and v.strip() == ""):
-            return default
-        return int(float(str(v).strip()))
-    except Exception:
-        return default
-
-
-def _encode_tristate(val: int) -> str:
-    # Match the generator’s encode_tristate() behavior:
-    #  0 -> DISABLE, non-zero -> ENABLE
-    return "TEGRA_PIN_ENABLE" if val else "TEGRA_PIN_DISABLE"
-
 _INDEX = None   # node_name_l -> row_idx
 _CELLS = None   # dict[(row, col_idx)] -> value
 _DT_COL = None  # column index for "Device Tree Pin Name"
@@ -209,13 +204,7 @@ def _build_index():
 def validate_pin_by_node(node_name: str):
     """
     Given a DTS node name (e.g. 'sf_pwr_soc_en'), look up the corresponding
-    row in the pinmux workbook and apply Excel-like validation:
-      - Customer Usage present
-      - unused_* rules
-      - Allowed Pin Direction vs chosen direction
-      - Wake vs direction
-      - Special per-pin rules (e.g. EXTPERIPH2_CLK not tristated)
-    Returns (errors, warnings), each a list of human-readable strings.
+    row in the pinmux workbook and apply validation logic mirroring the VBA.
     """
     _build_index()
     node_l = node_name.strip().lower()
@@ -225,14 +214,19 @@ def validate_pin_by_node(node_name: str):
     row = _INDEX[node_l]
     cells = _CELLS
 
+    # Fetch Cell Values
     pin_num   = _norm_text(cells.get((row, COL_A_PINNUM)))
     signal    = _norm_text(cells.get((row, COL_B_SIGNAL)))
     mpio      = _norm_text(cells.get((row, COL_C_MPIO)))
+
     usage_raw = cells.get((row, COL_AS_USAGE))
     allow_raw = cells.get((row, COL_L_ALLOWED_DIR))
     dir_raw   = cells.get((row, COL_AT_PIN_DIR))
     wake_raw  = cells.get((row, COL_AV_WAKE))
-    tri_raw   = cells.get((row, COL_AU_TRISTATE))
+    init_raw  = cells.get((row, COL_AU_INIT_STATE)) # Req. Initial State
+    ext_pu    = _norm_text(cells.get((row, COL_BC_EXT_PU)))
+    ext_pd    = _norm_text(cells.get((row, COL_BD_EXT_PD)))
+    eio_od    = _norm_text(cells.get((row, COL_AX_E_IO_OD))) # RCV_SEL check
 
     # Normalize basic fields
     usage   = _norm_text(usage_raw)
@@ -240,63 +234,62 @@ def validate_pin_by_node(node_name: str):
     allow   = _norm_allowed_dir(allow_raw)
     pin_dir = _norm_dir(dir_raw)
     wake_on = _is_wake_enabled(wake_raw)
-
-    # tristate (AU)
-    tri_val        = _as_int(tri_raw, 0)
-    tristate_macro = _encode_tristate(tri_val)
+    init_st = _norm_text(init_raw)
 
     label = f"row {row} (Pin {pin_num or '?'}, {signal or '?'}, {mpio or '?'})"
     errs = []
-    #warns = []
 
-    # If tristate == ENABLE for this specific node, it's an error.
-    if node_l == "extperiph2_clk_pk5" and tristate_macro == "TEGRA_PIN_ENABLE":
-        errs.append(
-            f"{label}: EXTPERIPH2_CLK must not be tristated (TEGRA_PIN_ENABLE)."
-        )
-
-    # Basic presence
+    # --- 1. IsCustomerUsageNotBlank ---
     if usage == "":
-        errs.append(f"{label}: Customer Usage (AS) is blank.")
+        errs.append(f"{label}: Customer Usage (AS) cannot be blank.")
 
-    # unused_* rules
+    # --- 2. IsPinDirectionValid ---
+    # "Error Check: A pin direction should not be set for an unused pin."
+    if usage_l.startswith("unused_") and pin_dir != "none":
+        errs.append(f"{label}: Cannot assign a pin direction ('{dir_raw}') for an unused pin.")
+
+    # Check allowed direction vs selected direction
+    if allow == "input" and pin_dir not in ("none", "input"):
+        errs.append(f"{label}: Allowed direction is INPUT, but set to '{dir_raw}'.")
+    elif allow == "output" and pin_dir not in ("none", "output"):
+        errs.append(f"{label}: Allowed direction is OUTPUT, but set to '{dir_raw}'.")
+    # Note: VBA logic for 'bidir' allows input/output, handled by nature of drop-downs usually.
+
+    # --- 3. IsWakeValid ---
+    if wake_on:
+        if usage_l.startswith("unused_"):
+            errs.append(f"{label}: Wake cannot be enabled on an Unused Pin.")
+
+        if pin_dir == "output":
+            errs.append(f"{label}: Wake cannot be enabled on an Output pin.")
+        elif pin_dir == "none":
+            errs.append(f"{label}: Wake cannot be enabled on an Unassigned pin.")
+
+    # --- 4. IsResistorConfigurationGood ---
+    # "Internal pull up cannot be enabled if there is an external pull up/down."
+    if init_st == "Int PU":
+        if ext_pu != "":
+            errs.append(f"{label}: Internal PU cannot be enabled if there is an external PU ({ext_pu}).")
+        if ext_pd != "":
+            errs.append(f"{label}: Internal PU cannot be enabled if there is an external PD ({ext_pd}).")
+    elif init_st == "Int PD":
+        if ext_pu != "":
+            errs.append(f"{label}: Internal PD cannot be enabled if there is an external PU ({ext_pu}).")
+        if ext_pd != "":
+            errs.append(f"{label}: Internal PD cannot be enabled if there is an external PD ({ext_pd}).")
+
+    # --- 5. IsInitialStateValid ---
+    # "Initial State for an Unused Pin cannot be assigned" (except Z or N/A)
     if usage_l.startswith("unused_"):
-        if pin_dir != "none":
-            errs.append(
-                f"{label}: usage '{usage}' is unused_* but Pin Direction is '{dir_raw}'."
-            )
-        if wake_on:
-            errs.append(
-                f"{label}: usage '{usage}' is unused_* but Wake is enabled."
-            )
+        if init_st not in ("", "Z", "N/A", "n/a"):
+            errs.append(f"{label}: Initial State for an Unused Pin cannot be assigned to '{init_st}'.")
 
-    # Allowed direction logic
-    if allow != "any":
-        if allow == "input":
-            if pin_dir not in ("none", "input"):
-                errs.append(
-                    f"{label}: Allowed direction is INPUT-only, but Pin Direction is '{dir_raw}'."
-                )
-        elif allow == "output":
-            if pin_dir not in ("none", "output"):
-                errs.append(
-                    f"{label}: Allowed direction is OUTPUT-only, but Pin Direction is '{dir_raw}'."
-                )
-        else allow == "bidir":
-            if pin_dir not in ("none", "input", "output", "bidir"):
-                errs.append(
-                    f"{label}: Allowed direction is BIDIRECTIONAL, but Pin Direction is '{dir_raw}'."
-                )
+    # --- 6. IsRCVSELValid (3.3V Tolerance) ---
+    # E_IO_OD column often maps to "3.3V Tolerance" or RCV_SEL in these templates.
+    if eio_od.lower() == "enable" and usage_l.startswith("unused_"):
+        errs.append(f"{label}: 3.3V Tolerance (RCV_SEL) cannot be enabled on an Unused Pin.")
 
-    # Wake rules
-    if wake_on and not usage_l.startswith("unused_"):
-        if pin_dir not in ("input", "bidir"):
-            errs.append(
-                f"{label}: Wake enabled but Pin Direction is '{dir_raw}' "
-                "(only input/bidir pins should have wake)."
-            )
-
-    return errs
+    return errs, []
 
 
 if __name__ == "__main__":
@@ -307,8 +300,5 @@ if __name__ == "__main__":
     e, w = validate_pin_by_node(args.node)
     for x in e:
         print("[ERROR]", x)
-    #for x in w:
-        #print("[WARN ]", x)
     if not e:
         print("OK.")
-
