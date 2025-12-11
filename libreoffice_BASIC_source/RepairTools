@@ -1,0 +1,55 @@
+REM  ***** BASIC  *****
+Option VBASupport 1
+Option Explicit
+
+Sub FixDropdowns()
+    Dim oSheet As Object
+    Dim oRange As Object
+    Dim oValidation As Object
+    Dim i As Long
+    Dim j As Long
+    Dim SheetName As String
+    Dim hasOptions As Boolean
+    
+    oSheet = ThisComponent.CurrentController.ActiveSheet
+    SheetName = "'" & oSheet.Name & "'"   ' Handle spaces in sheet name
+    
+    ' Loop through pin rows (adjust as needed)
+    For i = 13 To 479 
+        
+        ' Column AS = index 44
+        oRange = oSheet.getCellByPosition(44, i - 1) 
+        
+        ' Check if helper columns E:J contain any allowed functions
+        hasOptions = False
+        For j = 4 To 9   ' E (4) through J (9)
+            If Trim(oSheet.getCellByPosition(j, i - 1).String) <> "" Then
+                hasOptions = True
+                Exit For
+            End If
+        Next j
+        
+        If Not hasOptions Then
+            ' No valid options -> clear validation and skip
+            oRange.Validation = Nothing
+            GoTo NextRow
+        End If
+        
+        ' Create / update validation rule
+        oValidation = oRange.Validation
+        oValidation.Type = com.sun.star.sheet.ValidationType.LIST
+        oValidation.ShowErrorMessage = True
+        oValidation.ErrorMessage = "Please select a valid value."
+        oValidation.ShowList = True
+        
+        ' Reference E:J of the same row
+        ' Example: 'Jetson Thor_DevKit'.$E$165:$J$165
+        oValidation.setFormula1( SheetName & ".$E$" & i & ":$J$" & i )
+        
+        oRange.Validation = oValidation
+        
+NextRow:
+    Next i
+    
+    MsgBox "Dropdowns in Column AS have been repaired!"
+End Sub

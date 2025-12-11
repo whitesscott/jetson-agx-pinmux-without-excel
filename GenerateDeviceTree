@@ -1,0 +1,1165 @@
+REM  ***** BASIC  *****
+Option VBASupport 1
+Option Explicit
+Option Base 1
+
+' ==============================================================================
+'  GLOBAL VARIABLES
+' ==============================================================================
+Private DoubleTab As String
+Private TripleTab As String
+Private QuadTab As String
+Private CopyRightMessage1 As String
+Private CopyRightMessage2 As String
+Private PinmuxIncludeMessage As String
+Private PadVoltageIncludeMessage As String
+Private GPIOIncludeMessage As String
+Private IsInitialized As Boolean
+
+' ==============================================================================
+'  ERROR CODES
+' ==============================================================================
+Const SUCCESS          = 0
+Const ERR_PINTYPE      = -1
+Const ERR_PULL         = -2
+Const ERR_TRISTATE     = -3
+Const ERR_E_INPUT      = -4
+Const ERR_LOCK         = -5
+Const ERR_RCV_SEL      = -6
+Const ERR_WRONG_E_LPBK = -7
+Const ERR_LPDR         = -8
+Const ERR_EQOS         = -9
+Const ERR_SANITY       = -10
+Const ERR_FILEIO       = -11
+Const ERR_EMPTY_NAME   = -12
+Const INVALID          = "INVALID"
+
+' ==============================================================================
+'  BIT FLAGS
+' ==============================================================================
+Enum BallConfig
+    CFG_RCV_SEL    = 1
+    CFG_LOCK       = 2
+    CFG_OD         = 4
+    CFG_E_INPUT    = 8
+    CFG_TRISTATE   = 16
+    CFG_PULL_DOWN  = 32
+    CFG_PULL_UP    = 64
+    CFG_I2C        = 128
+    CFG_DDC        = 256
+    CFG_HAS_LPDR   = 512
+    CFG_HAS_EQOS   = 2048
+    CFG_EQOS       = 4096
+    CFG_DRV_1X     = 512
+    CFG_DEF_1X     = 1024
+End Enum
+
+Const CFG_E_LPBK = &H8000
+
+' ==============================================================================
+'  RANGE CONSTANTS
+' ==============================================================================
+Const RANGE_CONFIG_FIRST            = "AF10"
+Const RANGE_CONFIG_LAST             = "AF5000" 
+
+Const RANGE_CUSTOMER_USAGE          = "AS7"
+Const RANGE_MPIONAME                = "U7"
+Const RANGE_FIRST_PINMUXING_OPTION  = "F10"
+Const RANGE_FUNCTION_SAFE           = "T7"
+Const RANGE_PUPD                    = "AH7"
+Const RANGE_TRISTATE                = "AI7"
+Const RANGE_E_INPUT                 = "AJ7"
+Const RANGE_GPIO_INIT_VALUE         = "AK7"
+Const RANGE_RCV_SEL                 = "AX7"
+Const RANGE_PIN_DIRECTION           = "AT7"
+Const RANGE_LOCK                    = "AW7"
+Const RANGE_LPDR                    = "AY7"
+Const RANGE_EQOS                    = "AZ7"
+
+Const RANGE_FIRST_PADVOLTAGECONFIG  = "BK1109"
+Const RANGE_LAST_PADVOLTAGECONFIG   = "BK1111" 
+Const RANGE_PADVOLTAGECONFIG        = "BL1108"
+
+Const RANGE_ERROR_CHECK             = "AR7"
+
+' ==============================================================================
+'  INITIALIZATION
+' ==============================================================================
+Sub InitGlobals()
+    If IsInitialized Then Exit Sub
+
+    Dim NL As String
+    NL = Chr(10)
+
+    DoubleTab = vbTab & vbTab
+    TripleTab = vbTab & vbTab & vbTab
+    QuadTab   = vbTab & vbTab & vbTab & vbTab
+
+    ' UPDATED: Restored Copyright Headers
+    CopyRightMessage1 = "/*" & NL & _
+    " * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved." & NL & _
+    " * SPDX-License-Identifier: BSD-3-Clause" & NL & _
+    " *" & NL & _
+    " * Redistribution and use in source and binary forms, with or without" & NL & _
+    " * modification, are permitted provided that the following conditions are met:" & NL & _
+    " *" & NL & _
+    " * 1. Redistributions of source code must retain the above copyright notice, this" & NL & _
+    " * list of conditions and the following disclaimer." & NL & _
+    " *" & NL & _
+    " * 2. Redistributions in binary form must reproduce the above copyright notice," & NL & _
+    " * this list of conditions and the following disclaimer in the documentation" & NL & _
+    " * and/or other materials provided with the distribution." & NL & _
+    " * " & NL & _
+    " * 3. Neither the name of the copyright holder nor the names of its" & NL & _
+    " * contributors may be used to endorse or promote products derived from" & NL & _
+    " * this software without specific prior written permission." & NL & _
+    " *"
+
+    CopyRightMessage2 = _
+    " * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS 'AS IS'" & NL & _
+    " * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE" & NL & _
+    " * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE" & NL & _
+    " * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE" & NL & _
+    " * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL" & NL & _
+    " * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR" & NL & _
+    " * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER" & NL & _
+    " * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY," & NL & _
+    " * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE" & NL & _
+    " * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE." & NL & _
+    " */"
+
+    PinmuxIncludeMessage     = "#include ""t264-pinctrl-tegra.h"""
+    PadVoltageIncludeMessage = "#include ""./"
+    GPIOIncludeMessage       = "#include ""tegra264-gpio.h"""
+
+    IsInitialized = True
+End Sub
+
+' ==============================================================================
+'  ROW / RANGE HELPERS
+' ==============================================================================
+Function GetFirstRow() As Long
+    GetFirstRow = Range(RANGE_CONFIG_FIRST).Row
+End Function
+
+Function GetLastRow() As Long
+    GetLastRow = Range(RANGE_CONFIG_LAST).Row
+End Function
+
+Function GetUsage(ByRef RowNumber As Long) As String
+    Dim v
+    v = Worksheets(ActiveSheet.Name).Cells(RowNumber, Range(RANGE_CONFIG_FIRST).Column).Value
+    If IsError(v) Then GetUsage = "" Else GetUsage = CStr(v)
+End Function
+
+Function GetDocumentDirectory() As String
+    Dim docURL As String
+    Dim dirURL As String
+    Dim p As Long
+    On Error GoTo Fallback
+    docURL = ThisComponent.URL
+    If docURL = "" Then
+        GetDocumentDirectory = CurDir
+        Exit Function
+    End If
+    p = InStrRev(docURL, "/")
+    If p > 0 Then
+        dirURL = Left(docURL, p - 1)
+    Else
+        GetDocumentDirectory = CurDir
+        Exit Function
+    End If
+    GetDocumentDirectory = ConvertFromURL(dirURL)
+    Exit Function
+Fallback:
+    GetDocumentDirectory = CurDir
+End Function
+
+' ==============================================================================
+'  TOP-LEVEL MACRO
+' ==============================================================================
+Sub Generate_Device_Tree()
+    Call InitGlobals()
+
+    Dim RetVal As Integer
+
+    RetVal = MsgBox("Would you like to generate device tree file for pinmux table?", _
+                    vbQuestion + vbYesNo)
+    If RetVal = vbNo Then Exit Sub
+
+    RetVal = SanityCheck()
+    If RetVal <> SUCCESS Then
+        MsgBox "Error checking configuration (SanityCheck)." & vbCrLf & _
+               "Error code: " & CStr(RetVal), vbExclamation
+        Exit Sub
+    End If
+
+    RetVal = GenerateFile()
+    
+    If RetVal <> SUCCESS Then
+        If RetVal = ERR_SANITY Then
+             MsgBox "Configuration invalid (ERR_SANITY).", vbExclamation
+        End If
+    End If
+End Sub
+
+' ==============================================================================
+'  MAIN FILE GENERATOR
+' ==============================================================================
+Function GenerateFile() As Integer
+    InitGlobals
+
+    Dim Boardname          As String
+    Dim PinmuxFilename     As String
+    Dim GPIOFilename       As String
+    Dim PadVoltageFilename As String
+
+    Dim basePath           As String
+    Dim PinmuxFilePath     As String
+    Dim GPIOFilePath       As String
+    Dim PadVoltageFilePath As String
+
+    Dim PinmuxFileNum      As Integer
+    Dim GPIOFileNum        As Integer
+
+    Dim MPIOIndex()        As Integer
+    Dim MPIOName()         As String
+    Dim SFIOName()         As String
+    Dim GPIOName()         As String
+    Dim GPIOInitValue()    As Integer
+    Dim MPIOConfigValue()  As Integer
+
+    Dim NumberOfMPIO       As Integer
+    Dim NumberOfSFIO       As Integer
+    Dim NumberOfGPIO       As Integer
+    Dim NumberOfUnused     As Integer
+
+    Dim RetVal             As Integer
+    Dim Ver                As String
+    Dim sep                As String
+
+    RetVal = SUCCESS
+    GenerateFile = SUCCESS
+
+    On Error GoTo General_Error
+
+    Boardname = InputBox("Type the board name.", "Board Name", _
+                         LCase(Replace(ActiveSheet.Name, " Configuration", "")))
+    If Boardname = "" Then
+        MsgBox "BoardName cannot be empty."
+        RetVal = ERR_EMPTY_NAME
+        GoTo GenerateFile_End
+    End If
+    Boardname = LCase(Boardname)
+
+    PinmuxFilename     = "Thor-" & Boardname & "-pinmux.dtsi"
+    GPIOFilename       = "Thor-" & Boardname & "-gpio-default.dtsi"
+    PadVoltageFilename = "Thor-" & Boardname & "-padvoltage-default.dtsi"
+
+    basePath = GetDocumentDirectory()
+    sep = GetPathSeparator()
+
+    PinmuxFilePath     = basePath & sep & PinmuxFilename
+    GPIOFilePath       = basePath & sep & GPIOFilename
+    PadVoltageFilePath = basePath & sep & PadVoltageFilename
+
+    MsgBox "Writing files to:" & Chr(10) & basePath, vbInformation, "Output Path"
+
+    ' --- OPEN FILES ---
+    PinmuxFileNum = FreeFile()
+    Open PinmuxFilePath For Output As #PinmuxFileNum
+
+    GPIOFileNum = FreeFile()
+    Open GPIOFilePath For Output As #GPIOFileNum
+
+    ' --- READ DATA ---
+    RetVal = CountMPIO(NumberOfMPIO, NumberOfSFIO, NumberOfGPIO, NumberOfUnused)
+    If RetVal < 0 Then GoTo GenerateFile_End
+
+    RetVal = GroupPins(MPIOIndex, MPIOName, SFIOName, GPIOName, _
+                       GPIOInitValue, MPIOConfigValue, _
+                       NumberOfSFIO, NumberOfGPIO, NumberOfUnused)
+    If RetVal < 0 Then GoTo GenerateFile_End
+
+    Ver = Range("D4").Value
+
+    ' --- WRITE PINMUX ---
+    Print #PinmuxFileNum, "/*This dtsi file was generated by " & _
+                          Boardname & ".xlsm" & " Revision: " & Ver & " */"
+    Print #PinmuxFileNum, CopyRightMessage1
+    Print #PinmuxFileNum, CopyRightMessage2 & vbNewLine
+    Print #PinmuxFileNum, ""
+    Print #PinmuxFileNum, PinmuxIncludeMessage & vbNewLine
+    Print #PinmuxFileNum, PadVoltageIncludeMessage & GPIOFilename & Chr(34)
+    Print #PinmuxFileNum, ""
+    Print #PinmuxFileNum, "pinmux@ac281000 {"
+
+    RetVal = PrintPinmuxDT(PinmuxFileNum, MPIOName, SFIOName, MPIOConfigValue, _
+                           NumberOfSFIO, NumberOfGPIO, NumberOfUnused)
+    If RetVal < 0 Then GoTo GenerateFile_End
+    
+    Print #PinmuxFileNum, "};" & vbNewLine & ""
+
+    ' --- WRITE GPIO ---
+    Print #GPIOFileNum, "/*This dtsi file was generated by " & _
+                        Boardname & ".xlsm" & " Revision: " & Ver & " */"
+    Print #GPIOFileNum, CopyRightMessage1
+    Print #GPIOFileNum, CopyRightMessage2 & vbNewLine
+    Print #GPIOFileNum, GPIOIncludeMessage & vbNewLine
+    
+    RetVal = PrintGPIODT(GPIOFileNum, "MAIN", GPIOName, GPIOInitValue, _
+                         MPIOConfigValue, NumberOfSFIO, NumberOfGPIO, NumberOfUnused)
+    RetVal = PrintGPIODT(GPIOFileNum, "UPHY", GPIOName, GPIOInitValue, _
+                         MPIOConfigValue, NumberOfSFIO, NumberOfGPIO, NumberOfUnused)
+    RetVal = PrintGPIODT(GPIOFileNum, "AON", GPIOName, GPIOInitValue, _
+                         MPIOConfigValue, NumberOfSFIO, NumberOfGPIO, NumberOfUnused)
+    RetVal = PrintGPIODT(GPIOFileNum, "FSI", GPIOName, GPIOInitValue, _
+                         MPIOConfigValue, NumberOfSFIO, NumberOfGPIO, NumberOfUnused)
+
+    ' --- WRITE PAD VOLTAGE ---
+    RetVal = PrintPadVoltageFile(PadVoltageFilePath, Boardname, Ver)
+    If RetVal < 0 Then GoTo GenerateFile_End
+
+    MsgBox "Successfully wrote:" & vbCrLf & _
+           PinmuxFilename & vbCrLf & _
+           GPIOFilename & vbCrLf & _
+           PadVoltageFilename, vbInformation
+
+GenerateFile_End:
+    On Error Resume Next
+    If Not (MPIOIndex Is Nothing) Then Erase MPIOIndex
+    If Not (MPIOName Is Nothing) Then Erase MPIOName
+    If Not (MPIOConfigValue Is Nothing) Then Erase MPIOConfigValue
+    If PinmuxFileNum <> 0 Then Close #PinmuxFileNum
+    If GPIOFileNum <> 0 Then Close #GPIOFileNum
+    GenerateFile = RetVal
+    Exit Function
+
+General_Error:
+    MsgBox "CRITICAL ERROR in GenerateFile!" & vbCrLf & _
+           "Error: " & Err.Description & vbCrLf & _
+           "Line: " & Erl & vbCrLf & _
+           "Number: " & Err.Number, vbCritical
+    RetVal = ERR_FILEIO
+    Resume GenerateFile_End
+End Function
+
+' ==============================================================================
+'  SANITY CHECK / COUNTS
+' ==============================================================================
+Function SanityCheck() As Integer
+    Dim CurrentRow   As Long
+    Dim CurrentColumn As Long
+    Dim v
+
+    CurrentRow = GetFirstRow()
+    Do While CurrentRow <= GetLastRow()
+        CurrentColumn = Range(RANGE_ERROR_CHECK).Column 
+        v = Worksheets(ActiveSheet.Name).Cells(CurrentRow, CurrentColumn).Value
+        If CStr(v) = INVALID Then
+            SanityCheck = ERR_SANITY
+            Exit Function
+        End If
+        CurrentRow = CurrentRow + 1
+    Loop
+    SanityCheck = SUCCESS
+End Function
+
+Function CountMPIO(ByRef MPIOCount As Integer, _
+                   ByRef SFIOCount As Integer, _
+                   ByRef GPIOCount As Integer, _
+                   ByRef UnusedCount As Integer) As Integer
+
+    Dim CurrentRow   As Long
+    Dim CurrentVal   As Variant
+    Dim CurrentUsage As String
+
+    CurrentRow  = GetFirstRow()
+    MPIOCount   = 0
+    SFIOCount   = 0
+    GPIOCount   = 0
+    UnusedCount = 0
+
+    On Error GoTo Count_Err
+
+    Do While CurrentRow <= GetLastRow()
+        CurrentVal = Worksheets(ActiveSheet.Name).Cells( _
+                        CurrentRow, Range(RANGE_CONFIG_FIRST).Column).Value
+
+        If IsError(CurrentVal) Then CurrentVal = ""
+        
+        If CStr(CurrentVal) <> "" Then
+            MPIOCount = MPIOCount + 1
+            Dim uVal
+            uVal = Worksheets(ActiveSheet.Name).Cells( _
+                               CurrentRow, Range(RANGE_CUSTOMER_USAGE).Column).Value
+            If IsError(uVal) Then CurrentUsage = "" Else CurrentUsage = CStr(uVal)
+
+            If InStr(1, CurrentUsage, "unused") Then
+                UnusedCount = UnusedCount + 1
+            ElseIf InStr(1, CurrentUsage, "GPIO3") Then
+                GPIOCount = GPIOCount + 1
+            Else
+                SFIOCount = SFIOCount + 1
+            End If
+        End If
+        CurrentRow = CurrentRow + 1
+    Loop
+
+    CountMPIO = SUCCESS
+    Exit Function
+Count_Err:
+    MsgBox "Error in CountMPIO at row " & CurrentRow & ": " & Err.Description
+    CountMPIO = -1
+End Function
+
+' ==============================================================================
+'  ARRAY FILL / GROUPING
+' ==============================================================================
+Function FillArrays(ByRef MPIOIndex() As Integer, ByRef MPIOName() As String, _
+                    ByRef SFIOName() As String, ByRef GPIOName() As String, _
+                    ByRef GPIOInitValue() As Integer, ByRef MPIOConfigValue() As Integer, _
+                    ByRef NumberOfSFIO As Integer, ByRef NumberOfGPIO As Integer, _
+                    ByRef NumberOfUnused As Integer) As Integer
+
+    Dim CurrentRow         As Long
+    Dim CurrentVal         As Variant
+    Dim CurrentIndex       As Integer
+    Dim CurrentSFIOIndex   As Integer
+    Dim CurrentGPIOIndex   As Integer
+    Dim CurrentUnusedIndex As Integer
+    Dim CurrentUsage       As String
+    Dim PortName           As String
+    Dim PortType           As String
+    Dim RetVal             As Integer
+    Dim NumberOfMPIO       As Integer
+
+    Const AonListStr  = "AABBCCDDEE"
+    Const FsiListStr  = "ABACADAEAFAGAHAJ"
+    Const UphyListStr = "ABCDE"
+
+    NumberOfMPIO = NumberOfSFIO + NumberOfGPIO + NumberOfUnused
+    
+    If NumberOfMPIO = 0 Then
+        FillArrays = SUCCESS
+        Exit Function
+    End If
+
+    ReDim MPIOIndex(NumberOfMPIO) As Integer
+    ReDim MPIOName(NumberOfMPIO) As String
+    ReDim SFIOName(NumberOfMPIO) As String
+    ReDim GPIOName(NumberOfMPIO) As String
+    ReDim GPIOInitValue(NumberOfMPIO) As Integer
+    ReDim MPIOConfigValue(NumberOfMPIO) As Integer
+
+    CurrentRow         = GetFirstRow()
+    CurrentSFIOIndex   = 1
+    CurrentGPIOIndex   = 1 + NumberOfSFIO
+    CurrentUnusedIndex = 1 + NumberOfSFIO + NumberOfGPIO
+
+    On Error GoTo FillArrays_Fail
+
+    Do While CurrentRow <= GetLastRow()
+        CurrentVal = Worksheets(ActiveSheet.Name).Cells( _
+                        CurrentRow, Range(RANGE_CONFIG_FIRST).Column).Value
+        
+        If IsError(CurrentVal) Then CurrentVal = ""
+
+        If CStr(CurrentVal) <> "" Then
+            Dim uVal
+            uVal = Worksheets(ActiveSheet.Name).Cells( _
+                               CurrentRow, Range(RANGE_CUSTOMER_USAGE).Column).Value
+            If IsError(uVal) Then CurrentUsage = "" Else CurrentUsage = CStr(uVal)
+
+            If InStr(1, CurrentUsage, "unused") Then
+                CurrentIndex = CurrentUnusedIndex
+                CurrentUnusedIndex = CurrentUnusedIndex + 1
+            ElseIf InStr(1, CurrentUsage, "GPIO3") Then
+                CurrentIndex = CurrentGPIOIndex
+                CurrentGPIOIndex = CurrentGPIOIndex + 1
+            Else
+                CurrentIndex = CurrentSFIOIndex
+                CurrentSFIOIndex = CurrentSFIOIndex + 1
+            End If
+
+            If CurrentIndex > NumberOfMPIO Then GoTo SkipRow
+
+            MPIOIndex(CurrentIndex) = CurrentRow
+            
+            Dim nVal
+            nVal = Worksheets(ActiveSheet.Name).Cells( _
+                                       CurrentRow, Range(RANGE_MPIONAME).Column).Value
+            If IsError(nVal) Then MPIOName(CurrentIndex) = "UNKNOWN" Else MPIOName(CurrentIndex) = CStr(nVal)
+
+            Dim pOpt
+            pOpt = Worksheets(ActiveSheet.Name).Cells( _
+                            CurrentRow, Range(RANGE_FIRST_PINMUXING_OPTION).Column).Value
+            If IsError(pOpt) Then pOpt = ""
+            CurrentVal = CStr(pOpt)
+            
+            If CurrentVal <> "" Then
+                Dim pLen As Integer
+                pLen = Len(CurrentVal) - Len("GPIO3_P") - Len(".00")
+                If pLen > 0 Then
+                    PortName = UCase(Mid(CurrentVal, Len("GPIO3_P") + 1, pLen))
+
+                    If (InStr(FsiListStr, PortName) <> 0) And (Len(PortName) = 2) Then
+                        PortType = "TEGRA264_FSI_GPIO("
+                    ElseIf (InStr(AonListStr, PortName) <> 0) And (Len(PortName) = 2) Then
+                        PortType = "TEGRA264_AON_GPIO("
+                    ElseIf (InStr(UphyListStr, PortName) <> 0) And (Len(PortName) = 1) Then
+                        PortType = "TEGRA264_UPHY_GPIO("
+                    Else
+                        PortType = "TEGRA264_MAIN_GPIO("
+                    End If
+                    GPIOName(CurrentIndex) = PortType & PortName & ", " & Right(CurrentVal, 1) & ")"
+                End If
+            End If
+
+            If InStr(1, CurrentUsage, "unused") Or InStr(1, CurrentUsage, "GPIO3") Then
+                CurrentVal = Worksheets(ActiveSheet.Name).Cells( _
+                                 CurrentRow, Range(RANGE_FUNCTION_SAFE).Column).Value
+            Else
+                CurrentVal = Worksheets(ActiveSheet.Name).Cells( _
+                                 CurrentRow, Range(RANGE_CONFIG_FIRST).Column).Value
+            End If
+            If IsError(CurrentVal) Then SFIOName(CurrentIndex) = "" Else SFIOName(CurrentIndex) = LCase(CStr(CurrentVal))
+
+            MPIOConfigValue(CurrentIndex) = 0
+
+            CurrentVal = GetSafeStr(CurrentRow, Range(RANGE_PUPD).Column)
+            RetVal = SetPull(MPIOConfigValue(CurrentIndex), CStr(CurrentVal))
+            MPIOConfigValue(CurrentIndex) = RetVal
+
+            CurrentVal = GetSafeStr(CurrentRow, Range(RANGE_TRISTATE).Column)
+            RetVal = SetTristate(MPIOConfigValue(CurrentIndex), CStr(CurrentVal))
+            MPIOConfigValue(CurrentIndex) = RetVal
+
+            CurrentVal = GetSafeStr(CurrentRow, Range(RANGE_E_INPUT).Column)
+            RetVal = SetEInput(MPIOConfigValue(CurrentIndex), CStr(CurrentVal))
+            MPIOConfigValue(CurrentIndex) = RetVal
+
+            CurrentVal = GetSafeStr(CurrentRow, Range(RANGE_GPIO_INIT_VALUE).Column)
+            If (CurrentVal = "N/A" Or CurrentVal = "") Then
+                GPIOInitValue(CurrentIndex) = -1
+            ElseIf (CurrentVal = "1") Then
+                GPIOInitValue(CurrentIndex) = 1
+            Else
+                GPIOInitValue(CurrentIndex) = 0
+            End If
+
+            CurrentVal = GetSafeStr(CurrentRow, Range(RANGE_RCV_SEL).Column)
+            If (CurrentVal <> "") Then
+                MPIOConfigValue(CurrentIndex) = SetDDC(MPIOConfigValue(CurrentIndex))
+                RetVal = SetRCVSEL(MPIOConfigValue(CurrentIndex), UCase(CurrentVal))
+                MPIOConfigValue(CurrentIndex) = RetVal
+            End If
+
+            CurrentVal = GetSafeStr(CurrentRow, Range(RANGE_PIN_DIRECTION).Column)
+            If (CurrentVal = "Open-Drain") Then
+                RetVal = SetOD(MPIOConfigValue(CurrentIndex), "ENABLE")
+                MPIOConfigValue(CurrentIndex) = RetVal
+            End If
+
+            CurrentVal = GetSafeStr(CurrentRow, Range(RANGE_LOCK).Column)
+            If (CurrentVal <> "") Then
+                RetVal = SetLock(MPIOConfigValue(CurrentIndex), CStr(CurrentVal))
+                MPIOConfigValue(CurrentIndex) = RetVal
+            End If
+
+            CurrentVal = GetSafeStr(CurrentRow, Range(RANGE_LPDR).Column)
+            If (CurrentVal <> "") Then
+                RetVal = SetLPDR(MPIOConfigValue(CurrentIndex), UCase(CurrentVal))
+                MPIOConfigValue(CurrentIndex) = RetVal
+            End If
+
+            CurrentVal = GetSafeStr(CurrentRow, Range(RANGE_EQOS).Column)
+            If (CurrentVal <> "") Then
+                MPIOConfigValue(CurrentIndex) = SetHasEQOS(MPIOConfigValue(CurrentIndex))
+                RetVal = SetEQOS(MPIOConfigValue(CurrentIndex), UCase(CurrentVal))
+                MPIOConfigValue(CurrentIndex) = RetVal
+            End If
+        End If
+SkipRow:
+        CurrentRow = CurrentRow + 1
+    Loop
+
+    RetVal = SUCCESS
+    FillArrays = SUCCESS
+    Exit Function
+
+FillArrays_Fail:
+    MsgBox "Error in FillArrays at Row " & CurrentRow & ": " & Err.Description
+    FillArrays = -1
+End Function
+
+Function GetSafeStr(r As Long, c As Long) As String
+    Dim v
+    v = Worksheets(ActiveSheet.Name).Cells(r, c).Value
+    If IsError(v) Then GetSafeStr = "" Else GetSafeStr = CStr(v)
+End Function
+
+Function GroupPins(MPIOIndex() As Integer, ByRef MPIOName() As String, _
+                   ByRef SFIOName() As String, ByRef GPIOName() As String, _
+                   ByRef GPIOInitValue() As Integer, ByRef MPIOConfigValue() As Integer, _
+                   ByRef NumberOfSFIO As Integer, ByRef NumberOfGPIO As Integer, _
+                   ByRef NumberOfUnused As Integer) As Integer
+
+    Dim RetVal As Integer
+    RetVal = FillArrays(MPIOIndex, MPIOName, SFIOName, GPIOName, GPIOInitValue, _
+                        MPIOConfigValue, NumberOfSFIO, NumberOfGPIO, NumberOfUnused)
+    GroupPins = RetVal
+End Function
+
+' ==============================================================================
+'  PRINT PINMUX DT (Refactored to write directly to file)
+' ==============================================================================
+Function PrintPinmuxDT(ByVal FileNum As Integer, ByRef MPIOName() As String, _
+                       ByRef SFIOName() As String, ByRef MPIOConfigValue() As Integer, _
+                       ByRef MaxSFIOIndex As Integer, ByRef MaxGPIOIndex As Integer, _
+                       ByRef MaxUnusedIndex As Integer) As Integer
+
+    Call InitGlobals()
+
+    Dim CurrentIndex As Integer
+    Dim MaxUsedIndex As Integer
+    Dim MaxIndex As Integer
+
+    MaxUsedIndex = MaxSFIOIndex + MaxGPIOIndex
+    MaxIndex     = MaxUsedIndex + MaxUnusedIndex
+
+    Print #FileNum, DoubleTab & "common {"
+    Print #FileNum, TripleTab & "/* SFIO Pin Configuration */"
+
+    CurrentIndex = 1
+    Do While CurrentIndex <= MaxUsedIndex
+        Print #FileNum, TripleTab & MPIOName(CurrentIndex) & " {"
+        Print #FileNum, QuadTab & "nvidia,pins = " & Chr(34) & MPIOName(CurrentIndex) & Chr(34) & ";"
+        Print #FileNum, QuadTab & "nvidia,function = " & Chr(34) & SFIOName(CurrentIndex) & Chr(34) & ";"
+        Print #FileNum, QuadTab & "nvidia,pull = <" & GetPull(MPIOConfigValue(CurrentIndex)) & ">;"
+        Print #FileNum, QuadTab & "nvidia,tristate = <" & GetTristate(MPIOConfigValue(CurrentIndex)) & ">;"
+        Print #FileNum, QuadTab & "nvidia,enable-input = <" & GetEInput(MPIOConfigValue(CurrentIndex)) & ">;"
+        Print #FileNum, QuadTab & "nvidia,drv-type = <" & GetLPDR(MPIOConfigValue(CurrentIndex)) & ">;"
+
+        If (GetLock(MPIOConfigValue(CurrentIndex)) = "TEGRA_PIN_ENABLE") Then
+            Print #FileNum, QuadTab & "nvidia,lock = <" & GetLock(MPIOConfigValue(CurrentIndex)) & ">;"
+        End If
+        If (GetOD(MPIOConfigValue(CurrentIndex)) = "TEGRA_PIN_ENABLE") Then
+            Print #FileNum, QuadTab & "nvidia,open-drain = <" & GetOD(MPIOConfigValue(CurrentIndex)) & ">;"
+        End If
+        If GetDDC(MPIOConfigValue(CurrentIndex)) <> 0 Then
+            Print #FileNum, QuadTab & "nvidia,e-io-od = <" & GetRCVSEL(MPIOConfigValue(CurrentIndex)) & ">;"
+        End If
+        If GetHasEQOS(MPIOConfigValue(CurrentIndex)) <> 0 Then
+            Print #FileNum, QuadTab & "nvidia,e-lpbk = <" & GetEQOS(MPIOConfigValue(CurrentIndex)) & ">;"
+        End If
+
+        Print #FileNum, TripleTab & "};"
+        
+        If CurrentIndex < MaxUsedIndex Then Print #FileNum, "" 
+        
+        If CurrentIndex = MaxSFIOIndex Then
+            Print #FileNum, TripleTab & "/* GPIO Pin Configuration */"
+        End If
+        CurrentIndex = CurrentIndex + 1
+    Loop
+
+    Print #FileNum, DoubleTab & "};" & vbNewLine
+    Print #FileNum, vbTab & "pinmux_unused_lowpower: unused_lowpower {"
+
+    Do While CurrentIndex <= MaxIndex
+        Print #FileNum, TripleTab & MPIOName(CurrentIndex) & " {"
+        Print #FileNum, QuadTab & "nvidia,pins = " & Chr(34) & MPIOName(CurrentIndex) & Chr(34) & ";"
+        Print #FileNum, QuadTab & "nvidia,function = " & Chr(34) & SFIOName(CurrentIndex) & Chr(34) & ";"
+        Print #FileNum, QuadTab & "nvidia,pull = <" & GetPull(MPIOConfigValue(CurrentIndex)) & ">;"
+        Print #FileNum, QuadTab & "nvidia,tristate = <" & GetTristate(MPIOConfigValue(CurrentIndex)) & ">;"
+        Print #FileNum, QuadTab & "nvidia,enable-input = <" & GetEInput(MPIOConfigValue(CurrentIndex)) & ">;"
+        Print #FileNum, QuadTab & "nvidia,drv-type = <" & GetLPDR(MPIOConfigValue(CurrentIndex)) & ">;"
+
+        If (GetLock(MPIOConfigValue(CurrentIndex)) = "TEGRA_PIN_ENABLE") Then
+            Print #FileNum, QuadTab & "nvidia,lock = <" & GetLock(MPIOConfigValue(CurrentIndex)) & ">;"
+        End If
+        If (GetOD(MPIOConfigValue(CurrentIndex)) = "TEGRA_PIN_ENABLE") Then
+            Print #FileNum, QuadTab & "nvidia,open-drain = <" & GetOD(MPIOConfigValue(CurrentIndex)) & ">;"
+        End If
+        If GetDDC(MPIOConfigValue(CurrentIndex)) <> 0 Then
+            Print #FileNum, QuadTab & "nvidia,e-io-od = <" & GetRCVSEL(MPIOConfigValue(CurrentIndex)) & ">;"
+        End If
+        If GetHasEQOS(MPIOConfigValue(CurrentIndex)) <> 0 Then
+            Print #FileNum, QuadTab & "nvidia,e-lpbk = <" & GetEQOS(MPIOConfigValue(CurrentIndex)) & ">;"
+        End If
+
+        Print #FileNum, TripleTab & "};"
+        CurrentIndex = CurrentIndex + 1
+        If CurrentIndex <= MaxIndex Then Print #FileNum, ""
+    Loop
+
+    Print #FileNum, DoubleTab & "};" & vbNewLine
+    Print #FileNum, DoubleTab & "drive_default: drive {"
+    Print #FileNum, DoubleTab & "};"
+
+    PrintPinmuxDT = SUCCESS
+End Function
+
+' ==============================================================================
+'  PRINT GPIO DT (Refactored to write directly to file)
+' ==============================================================================
+Function PrintGPIODT(ByVal FileNum As Integer, ByRef GPIOType As String, _
+                     ByRef GPIOName() As String, ByRef GPIOInitValue() As Integer, _
+                     ByRef MPIOConfigValue() As Integer, _
+                     ByRef MaxSFIOIndex As Integer, _
+                     ByRef MaxGPIOIndex As Integer, _
+                     ByRef MaxUnusedIndex As Integer) As Integer
+
+    Call InitGlobals()
+
+    Dim CurrentIndex   As Integer
+    Dim MaxUsedIndex   As Integer
+    Dim MaxIndex       As Integer
+    
+    Dim sIn As String
+    Dim sLow As String
+    Dim sHigh As String
+    
+    Dim bInFirst As Boolean, bOutLowFirst As Boolean, bOutHighFirst As Boolean
+    Dim RetVal As Integer
+
+    MaxUsedIndex = MaxSFIOIndex + MaxGPIOIndex
+    MaxIndex     = MaxUsedIndex + MaxUnusedIndex
+    RetVal       = SUCCESS
+    
+    bInFirst = True
+    bOutLowFirst = True
+    bOutHighFirst = True
+
+    If GPIOType = "MAIN" Then
+        Print #FileNum, "gpio@ac300000 {" & vbNewLine & vbTab & " default {"
+    ElseIf GPIOType = "UPHY" Then
+        Print #FileNum, "gpio@e8300000 {" & vbNewLine & vbTab & " default {"
+    ElseIf GPIOType = "AON" Then
+        Print #FileNum, "gpio@8cf00000 {" & vbNewLine & vbTab & " default {"
+    Else
+        Print #FileNum, "gpio@b0320000 {" & vbNewLine & vbTab & " default {"
+    End If
+
+    CurrentIndex = MaxSFIOIndex + 1
+    
+    ' Build string content for pins
+    Do While CurrentIndex <= MaxUsedIndex
+        If (InStr(GPIOName(CurrentIndex), GPIOType) > 0) Then
+            
+            If (GPIOInitValue(CurrentIndex) = 1) Then
+                If Not bOutHighFirst Then sHigh = sHigh & vbNewLine & TripleTab
+                sHigh = sHigh & GPIOName(CurrentIndex)
+                bOutHighFirst = False
+
+            ElseIf (GPIOInitValue(CurrentIndex) = 0) Then
+                If Not bOutLowFirst Then sLow = sLow & vbNewLine & TripleTab
+                sLow = sLow & GPIOName(CurrentIndex)
+                bOutLowFirst = False
+
+            ElseIf GetEInput(MPIOConfigValue(CurrentIndex)) = "TEGRA_PIN_ENABLE" Then
+                If Not bInFirst Then sIn = sIn & vbNewLine & TripleTab
+                sIn = sIn & GPIOName(CurrentIndex)
+                bInFirst = False
+            End If
+        End If
+        CurrentIndex = CurrentIndex + 1
+    Loop
+
+    ' Output sections
+    Print #FileNum, DoubleTab & "gpio-input = <"
+    If Len(sIn) > 0 Then Print #FileNum, TripleTab & sIn
+    Print #FileNum, TripleTab & ">;"
+    
+    Print #FileNum, DoubleTab & "gpio-output-low = <"
+    If Len(sLow) > 0 Then Print #FileNum, TripleTab & sLow
+    Print #FileNum, TripleTab & ">;"
+
+    Print #FileNum, DoubleTab & "gpio-output-high = <"
+    If Len(sHigh) > 0 Then Print #FileNum, TripleTab & sHigh
+    Print #FileNum, TripleTab & ">;"
+
+    Print #FileNum, vbTab & "};" & vbNewLine & "};"
+
+    PrintGPIODT = RetVal
+End Function
+
+' ==============================================================================
+'  PRINT PAD VOLTAGE DT
+' ==============================================================================
+Function PrintPadVoltageFile(ByVal PadVoltageFilePath As String, _
+                             ByVal Boardname As String, _
+                             ByVal Ver As String) As Integer
+
+    InitGlobals
+
+    Dim PadVoltageFileNum As Integer
+    Dim RetVal           As Integer
+    Dim CurrentRow       As Long
+    Dim LastRow          As Long
+    Dim CurrentVoltage   As String
+    Dim CurrentRailName  As String
+    Dim v
+
+    RetVal = SUCCESS
+    PrintPadVoltageFile = SUCCESS
+
+    On Error GoTo PrintPadVoltageFile_Error
+
+    PadVoltageFileNum = FreeFile()
+    Open PadVoltageFilePath For Output As #PadVoltageFileNum
+
+    Print #PadVoltageFileNum, "/*This dtsi file was generated by " & _
+                              Boardname & ".xlsm" & " Revision: " & Ver & " */"
+    Print #PadVoltageFileNum, CopyRightMessage1
+    Print #PadVoltageFileNum, CopyRightMessage2 & vbNewLine
+    Print #PadVoltageFileNum, "#define IO_PAD_VOLTAGE_1_2V 1200000"
+    Print #PadVoltageFileNum, "#define IO_PAD_VOLTAGE_1_8V 1800000"
+    Print #PadVoltageFileNum, "#define IO_PAD_VOLTAGE_3_3V 3300000"
+    Print #PadVoltageFileNum, ""
+    Print #PadVoltageFileNum, ""
+    Print #PadVoltageFileNum, "pmc@8c800000 {"
+    Print #PadVoltageFileNum, vbTab & "io-pad-defaults {"
+
+    CurrentRow = Range(RANGE_FIRST_PADVOLTAGECONFIG).Row
+    LastRow    = Range(RANGE_LAST_PADVOLTAGECONFIG).Row
+
+    Do While CurrentRow <= LastRow
+        v = Worksheets(ActiveSheet.Name).Cells( _
+                                 CurrentRow, Range(RANGE_FIRST_PADVOLTAGECONFIG).Column).Value
+        If IsError(v) Then CurrentRailName = "" Else CurrentRailName = LCase(CStr(v))
+        
+        v = Worksheets(ActiveSheet.Name).Cells( _
+                                 CurrentRow, Range(RANGE_PADVOLTAGECONFIG).Column).Value
+        If IsError(v) Then CurrentVoltage = "" Else CurrentVoltage = CStr(v)
+
+        If CurrentRailName <> "" Then
+            Print #PadVoltageFileNum, DoubleTab & CurrentRailName & " {"
+            If CurrentVoltage = "1.8V" Then
+                Print #PadVoltageFileNum, TripleTab & _
+                    "nvidia,io-pad-init-voltage = <IO_PAD_VOLTAGE_1_8V>;"
+            ElseIf CurrentVoltage = "1.2V" Then
+                Print #PadVoltageFileNum, TripleTab & _
+                    "nvidia,io-pad-init-voltage = <IO_PAD_VOLTAGE_1_2V>;"
+            ElseIf CurrentVoltage = "1.8V/3.3V_default_1.8V" Then
+                Print #PadVoltageFileNum, TripleTab & _
+                    "nvidia,io-pad-init-voltage = <IO_PAD_VOLTAGE_1_8V>;"
+            Else
+                Print #PadVoltageFileNum, TripleTab & _
+                    "nvidia,io-pad-init-voltage = <IO_PAD_VOLTAGE_3_3V>;"
+            End If
+            Print #PadVoltageFileNum, DoubleTab & "};" & vbNewLine
+        End If
+        CurrentRow = CurrentRow + 1
+    Loop
+
+    Print #PadVoltageFileNum, vbTab & "};" & vbNewLine & "};"
+
+    Close #PadVoltageFileNum
+    Exit Function
+
+PrintPadVoltageFile_Error:
+    MsgBox "Error in PrintPadVoltageFile: " & Err.Description
+    RetVal = ERR_FILEIO
+    PrintPadVoltageFile = RetVal
+    On Error Resume Next
+    If PadVoltageFileNum <> 0 Then Close #PadVoltageFileNum
+End Function
+
+' ==============================================================================
+'  BIT-SETTING HELPERS (Identical to previous, kept for completeness)
+' ==============================================================================
+Function SetType(ByRef ConfigBits As Integer, ByRef PinType As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(PinType))
+    If v = "REG" Then
+        NewConfigBits = ConfigBits And (Not CFG_I2C) And (Not CFG_DDC)
+    ElseIf v = "I2C" Then
+        NewConfigBits = (ConfigBits Or CFG_I2C) And (Not CFG_DDC)
+    ElseIf v = "DDC" Then
+        NewConfigBits = (ConfigBits And (Not CFG_I2C)) Or CFG_DDC
+    Else
+        NewConfigBits = ERR_PINTYPE
+    End If
+    SetType = NewConfigBits
+End Function
+
+Function GetType(ByRef ConfigBits As Integer) As Integer
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And (CFG_I2C Or CFG_DDC)
+    CheckerNumber = (CheckerNumber \ CFG_I2C) Mod 4
+    If CheckerNumber > 2 Then CheckerNumber = ERR_PINTYPE
+    GetType = CheckerNumber
+End Function
+
+Function SetPull(ByRef ConfigBits As Integer, ByRef PUPD As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(PUPD))
+    If v = "" Or v = "NORMAL" Or v = "N/A" Then
+        NewConfigBits = ConfigBits And (Not CFG_PULL_UP) And (Not CFG_PULL_DOWN)
+    ElseIf v = "PULL_DOWN" Or v = "PULL-DOWN" Or v = "PULL DOWN" Then
+        NewConfigBits = (ConfigBits And (Not CFG_PULL_UP)) Or CFG_PULL_DOWN
+    ElseIf v = "PULL_UP" Or v = "PULL-UP" Or v = "PULL UP" Then
+        NewConfigBits = (ConfigBits Or CFG_PULL_UP) And (Not CFG_PULL_DOWN)
+    Else
+        NewConfigBits = ConfigBits
+    End If
+    SetPull = NewConfigBits
+End Function
+
+Function GetPull(ByRef ConfigBits As Integer) As String
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And (CFG_PULL_UP Or CFG_PULL_DOWN)
+    CheckerNumber = (CheckerNumber \ CFG_PULL_DOWN) Mod 4
+    If CheckerNumber > 2 Then CheckerNumber = ERR_PULL
+    If CheckerNumber = 0 Then
+        GetPull = "TEGRA_PIN_PULL_NONE"
+    ElseIf CheckerNumber = 1 Then
+        GetPull = "TEGRA_PIN_PULL_DOWN"
+    ElseIf CheckerNumber = 2 Then
+        GetPull = "TEGRA_PIN_PULL_UP"
+    Else
+        GetPull = CStr(CheckerNumber)
+    End If
+End Function
+
+Function SetTristate(ByRef ConfigBits As Integer, ByVal Tristate As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(Tristate))
+    If v = "" Or v = "NORMAL" Or v = "0" Then
+        NewConfigBits = ConfigBits And (Not CFG_TRISTATE)
+    ElseIf v = "TRISTATE" Or v = "1" Then
+        NewConfigBits = ConfigBits Or CFG_TRISTATE
+    Else
+        NewConfigBits = ConfigBits And (Not CFG_TRISTATE)
+    End If
+    SetTristate = NewConfigBits
+End Function
+
+Function GetTristate(ByRef ConfigBits As Integer) As String
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And CFG_TRISTATE
+    CheckerNumber = (CheckerNumber \ CFG_TRISTATE) Mod 2
+    If CheckerNumber = 0 Then
+        GetTristate = "TEGRA_PIN_DISABLE"
+    Else
+        GetTristate = "TEGRA_PIN_ENABLE"
+    End If
+End Function
+
+Function SetEInput(ByRef ConfigBits As Integer, ByVal EInput As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(EInput))
+    If v = "" Or v = "DISABLE" Or v = "0" Then
+        NewConfigBits = ConfigBits And (Not CFG_E_INPUT)
+    ElseIf v = "ENABLE" Or v = "1" Then
+        NewConfigBits = ConfigBits Or CFG_E_INPUT
+    Else
+        NewConfigBits = ConfigBits And (Not CFG_E_INPUT)
+    End If
+    SetEInput = NewConfigBits
+End Function
+
+Function GetEInput(ByRef ConfigBits As Integer) As String
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And CFG_E_INPUT
+    CheckerNumber = (CheckerNumber \ CFG_E_INPUT) Mod 2
+    If CheckerNumber = 0 Then
+        GetEInput = "TEGRA_PIN_DISABLE"
+    Else
+        GetEInput = "TEGRA_PIN_ENABLE"
+    End If
+End Function
+
+Function SetOD(ByRef ConfigBits As Integer, ByRef OD As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(OD))
+    If v = "ENABLE" Then
+        NewConfigBits = ConfigBits Or CFG_OD
+    Else
+        NewConfigBits = ConfigBits And (Not CFG_OD)
+    End If
+    SetOD = NewConfigBits
+End Function
+
+Function GetOD(ByRef ConfigBits As Integer) As String
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And CFG_OD
+    CheckerNumber = (CheckerNumber \ CFG_OD) Mod 2
+    If CheckerNumber = 0 Then
+        GetOD = "TEGRA_PIN_DISABLE"
+    Else
+        GetOD = "TEGRA_PIN_ENABLE"
+    End If
+End Function
+
+Function SetLock(ByRef ConfigBits As Integer, ByVal LockED As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(LockED))
+    If v = "" Or v = "DISABLE" Or v = "DISABLED" Or v = "0" Then
+        NewConfigBits = ConfigBits And (Not CFG_LOCK)
+    ElseIf v = "ENABLE" Or v = "ENABLED" Or v = "1" Then
+        NewConfigBits = ConfigBits Or CFG_LOCK
+    Else
+        NewConfigBits = ConfigBits And (Not CFG_LOCK)
+    End If
+    SetLock = NewConfigBits
+End Function
+
+Function GetLock(ByRef ConfigBits As Integer) As String
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And CFG_LOCK
+    CheckerNumber = (CheckerNumber \ CFG_LOCK) Mod 2
+    If CheckerNumber = 0 Then
+        GetLock = "TEGRA_PIN_DISABLE"
+    Else
+        GetLock = "TEGRA_PIN_ENABLE"
+    End If
+End Function
+
+Function SetRCVSEL(ByRef ConfigBits As Integer, ByVal RCVSEL As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(RCVSEL))
+    If v = "" Or v = "DISABLE" Or v = "DISABLED" Or v = "0" Then
+        NewConfigBits = ConfigBits And (Not CFG_RCV_SEL)
+    ElseIf v = "ENABLE" Or v = "ENABLED" Or v = "1" Then
+        NewConfigBits = ConfigBits Or CFG_RCV_SEL
+    Else
+        NewConfigBits = ConfigBits And (Not CFG_RCV_SEL)
+    End If
+    SetRCVSEL = NewConfigBits
+End Function
+
+Function GetRCVSEL(ByRef ConfigBits As Integer) As String
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And CFG_RCV_SEL
+    CheckerNumber = (CheckerNumber \ CFG_RCV_SEL) Mod 2
+    If CheckerNumber = 0 Then
+        GetRCVSEL = "TEGRA_PIN_DISABLE"
+    Else
+        GetRCVSEL = "TEGRA_PIN_ENABLE"
+    End If
+End Function
+
+Function SetELPBK(ByRef ConfigBits As Integer, ByRef ELPBK As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(ELPBK))
+    If v = "DISABLE" Then
+        NewConfigBits = ConfigBits And (Not CFG_E_LPBK)
+    ElseIf v = "ENABLE" Then
+        NewConfigBits = ConfigBits Or CFG_E_LPBK
+    Else
+        NewConfigBits = ERR_WRONG_E_LPBK
+    End If
+    SetELPBK = NewConfigBits
+End Function
+
+Function SetDDC(ByRef ConfigBits As Integer) As Integer
+    Dim NewConfigBits As Integer
+    NewConfigBits = ConfigBits Or CFG_DDC
+    SetDDC = NewConfigBits
+End Function
+
+Function GetDDC(ByRef ConfigBits As Integer) As Integer
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And CFG_DDC
+    CheckerNumber = (CheckerNumber \ CFG_DDC) Mod 2
+    GetDDC = CheckerNumber
+End Function
+
+Function SetI2C(ByRef ConfigBits As Integer) As Integer
+    Dim NewConfigBits As Integer
+    NewConfigBits = ConfigBits Or CFG_I2C
+    SetI2C = NewConfigBits
+End Function
+
+Function GetI2C(ByRef ConfigBits As Integer) As Integer
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And CFG_I2C
+    CheckerNumber = (CheckerNumber \ CFG_I2C) Mod 2
+    GetI2C = CheckerNumber
+End Function
+
+Function SetLPDR(ByRef ConfigBits As Integer, ByVal LPDR As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(LPDR))
+    If v = "" Or v = "DISABLE" Or v = "NORMAL" Or v = "0" Then
+        NewConfigBits = ConfigBits And (Not CFG_DEF_1X) And (Not CFG_DRV_1X)
+    ElseIf v = "ENABLE" Or v = "1" Then
+        NewConfigBits = (ConfigBits And (Not CFG_DEF_1X)) Or CFG_DRV_1X
+    ElseIf v = "DEF_1X" Then
+        NewConfigBits = (ConfigBits Or CFG_DEF_1X) And (Not CFG_DRV_1X)
+    ElseIf v = "DEF_2X" Then
+        NewConfigBits = ConfigBits Or CFG_DRV_1X Or CFG_DEF_1X
+    Else
+        NewConfigBits = ConfigBits And (Not CFG_DEF_1X) And (Not CFG_DRV_1X)
+    End If
+    SetLPDR = NewConfigBits
+End Function
+
+
+Function GetLPDR(ByRef ConfigBits As Integer) As String
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And (CFG_DRV_1X Or CFG_DEF_1X)
+    CheckerNumber = (CheckerNumber \ CFG_DRV_1X) Mod 4
+    If CheckerNumber > 3 Then CheckerNumber = ERR_LPDR
+    If CheckerNumber = 0 Then
+        GetLPDR = "TEGRA_PIN_1X_DRIVER"
+    ElseIf CheckerNumber = 1 Then
+        GetLPDR = "TEGRA_PIN_2X_DRIVER"
+    ElseIf CheckerNumber = 2 Then
+        GetLPDR = "TEGRA_PIN_DEFAULT_DRIVE_1X"
+    ElseIf CheckerNumber = 3 Then
+        GetLPDR = "TEGRA_PIN_DEFAULT_DRIVE_2X"
+    Else
+        GetLPDR = "TEGRA_PIN_COMP"
+    End If
+End Function
+
+Function SetHasEQOS(ByRef ConfigBits As Integer) As Integer
+    Dim NewConfigBits As Integer
+    NewConfigBits = ConfigBits Or CFG_HAS_EQOS
+    SetHasEQOS = NewConfigBits
+End Function
+
+Function GetHasEQOS(ByRef ConfigBits As Integer) As Integer
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And CFG_HAS_EQOS
+    CheckerNumber = (CheckerNumber \ CFG_HAS_EQOS) Mod 2
+    GetHasEQOS = CheckerNumber
+End Function
+
+Function SetEQOS(ByRef ConfigBits As Integer, ByVal EQOS As String) As Integer
+    Dim NewConfigBits As Integer
+    Dim v As String
+    v = UCase(Trim(EQOS))
+    If v = "" Or v = "DISABLE" Or v = "DISABLED" Or v = "0" Then
+        NewConfigBits = ConfigBits And (Not CFG_EQOS)
+    ElseIf v = "ENABLE" Or v = "ENABLED" Or v = "1" Then
+        NewConfigBits = ConfigBits Or CFG_EQOS
+    Else
+        NewConfigBits = ConfigBits And (Not CFG_EQOS)
+    End If
+    SetEQOS = NewConfigBits
+End Function
+
+Function GetEQOS(ByRef ConfigBits As Integer) As String
+    Dim CheckerNumber As Integer
+    CheckerNumber = ConfigBits And CFG_EQOS
+    CheckerNumber = (CheckerNumber \ CFG_EQOS) Mod 2
+    If CheckerNumber = 0 Then
+        GetEQOS = "TEGRA_PIN_DISABLE"
+    Else
+        GetEQOS = "TEGRA_PIN_ENABLE"
+    End If
+End Function

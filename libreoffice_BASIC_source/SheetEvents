@@ -1,0 +1,349 @@
+REM  ***** BASIC  *****
+Option VBASupport 1
+Option Explicit
+
+' ==============================================================================
+'  CONSTANTS - Mapped to Physical Addresses (Safe for Math Parser)
+' ==============================================================================
+
+' --- Pin Direction Validation Ranges ---
+Public Const RANGE_ALLOWED_PIN_DIRECTION_GPIO  = "K7"
+Public Const RANGE_ALLOWED_PIN_DIRECTION_SFIO0 = "L7"
+Public Const RANGE_ALLOWED_PIN_DIRECTION_SFIO1 = "M7"
+Public Const RANGE_ALLOWED_PIN_DIRECTION_SFIO2 = "N7"
+Public Const RANGE_ALLOWED_PIN_DIRECTION_SFIO3 = "O7"
+
+' --- Table Boundaries ---
+Public Const RANGE_FIRST_MPIO         = "C9"
+Public Const RANGE_LAST_MPIO          = "C292"
+Public Const RANGE_CONFIG_FIRST       = "AF10"
+Public Const RANGE_CONFIG_LAST        = "AK292"
+
+' --- Column Headers / Configuration Cells ---
+Public Const RANGE_CUSTOMER_USAGE     = "AS7"
+Public Const RANGE_PIN_DIRECTION      = "AT7"
+Public Const RANGE_INITIAL_STATE      = "AU7"
+Public Const RANGE_WAKE_PIN           = "AV7"
+Public Const RANGE_LOCK               = "AW7"
+Public Const RANGE_RCV_SEL            = "AX7"
+Public Const RANGE_LPDR               = "AY7"
+Public Const RANGE_EQOS               = "AZ7"
+
+' --- Pin Configuration Columns ---
+Public Const RANGE_TRISTATE           = "AI7"
+Public Const RANGE_PUPD               = "AH7"
+Public Const RANGE_E_INPUT            = "AJ7"
+Public Const RANGE_GPIO_INIT_VALUE    = "AK7"
+Public Const RANGE_EXT_PU             = "BF7"
+Public Const RANGE_EXT_PD             = "BG7"
+
+' --- Checkers (Hidden Columns) ---
+Public Const RANGE_CUSTOMER_USAGE_CHECKER = "AL7"
+Public Const RANGE_INITIAL_STATE_CHECKER  = "AM7"
+Public Const RANGE_PIN_DIRECTION_CHECKER  = "AN7"
+Public Const RANGE_WAKE_CHECKER           = "AO7"
+Public Const RANGE_RESISTOR_CHECKER       = "AP7"
+Public Const RANGE_RCV_SEL_CHECKER        = "AQ7"
+Public Const RANGE_ERROR_CHECK            = "AR7"
+
+' --- Pinmux Headers ---
+Public Const RANGE_PINMUX_UNUSED      = "E7"
+Public Const RANGE_PINMUX_GPIO        = "F7"
+Public Const RANGE_PINMUX_SFIO0       = "G7"
+Public Const RANGE_PINMUX_SFIO1       = "H7"
+Public Const RANGE_PINMUX_SFIO2       = "I7"
+Public Const RANGE_PINMUX_SFIO3       = "J7"
+
+' ==============================================================================
+'  EVENT HANDLER
+' ==============================================================================
+Sub OnContentChanged(oEvent As Object)
+    
+    Dim CurrentRow As Long
+    Dim CurrentCol As Long
+    Dim FirstMpioRow As Long
+    Dim LastMpioRow As Long
+    Dim Result As Boolean
+    
+    ' Basic check to ensure a single cell was edited
+    If Not oEvent.SupportsService("com.sun.star.sheet.SheetCell") Then Exit Sub
+
+    ' LibreOffice uses 0-based indexing; we convert to 1-based for logic
+    CurrentRow = oEvent.CellAddress.Row + 1
+    CurrentCol = oEvent.CellAddress.Column + 1
+    
+    ' Use Math-based GetRow to safely find bounds.
+    FirstMpioRow = GetRow(RANGE_FIRST_MPIO)
+    LastMpioRow = GetRow(RANGE_LAST_MPIO) - 1
+    
+    If FirstMpioRow < 1 Then FirstMpioRow = 9
+    If LastMpioRow < 1 Then LastMpioRow = 5000
+    
+    ' Check if we are inside the data table rows
+    If CurrentRow < FirstMpioRow Or CurrentRow > LastMpioRow Then Exit Sub
+
+    ' --- Logic: Check which column was changed using Math GetCol ---
+    
+    ' 1. Customer Usage Changed
+    If CurrentCol = GetCol(RANGE_CUSTOMER_USAGE) Then
+        Result = IsCustomerUsageNotBlank(CurrentRow)
+        SetVal RANGE_CUSTOMER_USAGE_CHECKER, CurrentRow, Result
+        
+        If Result Then
+            SetVal RANGE_PIN_DIRECTION_CHECKER, CurrentRow, IsPinDirectionValid(CurrentRow)
+            SetVal RANGE_RCV_SEL_CHECKER, CurrentRow, IsRCVSELValid(CurrentRow)
+            SetVal RANGE_WAKE_CHECKER, CurrentRow, IsWakeValid(CurrentRow)
+            
+            Dim cVal As String
+            cVal = oEvent.String
+            If Right(cVal, 1) = "*" Then
+                MsgBox "Warning: Please check with Nvidia AEs before using this function."
+            End If
+        End If
+    End If
+    
+    ' 2. Pin Direction Changed
+    If CurrentCol = GetCol(RANGE_PIN_DIRECTION) Then
+        SetVal RANGE_PIN_DIRECTION_CHECKER, CurrentRow, IsPinDirectionValid(CurrentRow)
+        SetVal RANGE_WAKE_CHECKER, CurrentRow, IsWakeValid(CurrentRow)
+    End If
+    
+    ' 3. Initial State Changed
+    If CurrentCol = GetCol(RANGE_INITIAL_STATE) Then
+        SetVal RANGE_INITIAL_STATE_CHECKER, CurrentRow, IsInitialStateValid(CurrentRow)
+        SetVal RANGE_RESISTOR_CHECKER, CurrentRow, IsResistorConfigurationGood(CurrentRow)
+    End If
+    
+    ' 4. Wake Pin Changed
+    If CurrentCol = GetCol(RANGE_WAKE_PIN) Then
+        SetVal RANGE_WAKE_CHECKER, CurrentRow, IsWakeValid(CurrentRow)
+    End If
+    
+    ' 5. Ext Pull Up Changed
+    If CurrentCol = GetCol(RANGE_EXT_PU) Then
+        SetVal RANGE_RESISTOR_CHECKER, CurrentRow, IsResistorConfigurationGood(CurrentRow)
+    End If
+    
+    ' 6. Ext Pull Down Changed
+    If CurrentCol = GetCol(RANGE_EXT_PD) Then
+        SetVal RANGE_RESISTOR_CHECKER, CurrentRow, IsResistorConfigurationGood(CurrentRow)
+    End If
+    
+    ' 7. RCV_SEL Changed (3.3V Tolerance)
+    If CurrentCol = GetCol(RANGE_RCV_SEL) Then
+        SetVal RANGE_RCV_SEL_CHECKER, CurrentRow, IsRCVSELValid(CurrentRow)
+    End If
+
+End Sub
+
+' ==============================================================================
+'  HELPER FUNCTIONS (Pure Math - NO API CALLS)
+' ==============================================================================
+
+' Safely calculate Column Index from Address String (e.g. "AS7" -> 45)
+Function GetCol(ByVal RangeName As String) As Long
+    Dim i As Integer, charCode As Integer
+    Dim colStr As String
+    Dim colNum As Long
+    
+    colStr = ""
+    RangeName = UCase(RangeName)
+    
+    ' Extract letters (A-Z)
+    For i = 1 To Len(RangeName)
+        charCode = Asc(Mid(RangeName, i, 1))
+        If charCode >= 65 And charCode <= 90 Then
+            colStr = colStr & Mid(RangeName, i, 1)
+        ElseIf charCode <> 36 Then ' Skip $ sign, stop at anything else
+            Exit For
+        End If
+    Next i
+    
+    ' Convert Base26 to Integer
+    colNum = 0
+    For i = 1 To Len(colStr)
+        colNum = colNum * 26 + (Asc(Mid(colStr, i, 1)) - 64)
+    Next i
+    
+    GetCol = colNum
+End Function
+
+' Safely calculate Row Index from Address String
+Function GetRow(ByVal RangeName As String) As Long
+    Dim i As Integer
+    Dim rowStr As String
+    
+    rowStr = ""
+    For i = 1 To Len(RangeName)
+        If IsNumeric(Mid(RangeName, i, 1)) Then
+            rowStr = rowStr & Mid(RangeName, i, 1)
+        End If
+    Next i
+    
+    If rowStr <> "" Then GetRow = CLng(rowStr) Else GetRow = -1
+End Function
+
+' Helper to Write value to cell safely
+Sub SetVal(RangeName As String, r As Long, Val As Variant)
+    On Error Resume Next
+    Dim oSheet As Object
+    Dim c As Long
+    c = GetCol(RangeName)
+    
+    If c > 0 Then
+        oSheet = ThisComponent.CurrentController.ActiveSheet
+        ' getCellByPosition uses (Column, Row) and is 0-based
+        oSheet.getCellByPosition(c - 1, r - 1).String = CStr(Val)
+    End If
+End Sub
+
+' Helper to Read value from cell safely
+Function GetCellValue(r As Long, c As Long) As String
+    On Error Resume Next
+    Dim oSheet As Object
+    oSheet = ThisComponent.CurrentController.ActiveSheet
+    If c > 0 And r > 0 Then
+        GetCellValue = oSheet.getCellByPosition(c - 1, r - 1).String
+    Else
+        GetCellValue = ""
+    End If
+End Function
+
+' ==============================================================================
+'  LOGIC FUNCTIONS
+' ==============================================================================
+
+Function IsPinDirectionValid(ByVal CurrentRow As Long) As Boolean
+    Dim SelectedCustomerUsage As String
+    Dim SelectedPinDirection As String
+    Dim AllowedPinDirection As String
+    
+    SelectedCustomerUsage = GetCellValue(CurrentRow, GetCol(RANGE_CUSTOMER_USAGE))
+    SelectedPinDirection  = GetCellValue(CurrentRow, GetCol(RANGE_PIN_DIRECTION))
+    
+    If Left(SelectedCustomerUsage, 7) = "unused_" And SelectedPinDirection <> "Not Assigned" And SelectedPinDirection <> "" Then
+        IsPinDirectionValid = False
+        MsgBox "Error: Cannot assign a pin direction for an unused pin."
+        Exit Function
+    ElseIf SelectedPinDirection = "Not Assigned" Then
+        IsPinDirectionValid = True
+        Exit Function
+    End If
+     
+    ' Look up valid usage types from header row 7 based on column position
+    If SelectedCustomerUsage = GetCellValue(CurrentRow, GetCol(RANGE_PINMUX_GPIO)) Then
+        AllowedPinDirection = GetCellValue(CurrentRow, GetCol(RANGE_ALLOWED_PIN_DIRECTION_GPIO))
+    ElseIf SelectedCustomerUsage = GetCellValue(CurrentRow, GetCol(RANGE_PINMUX_SFIO0)) Then
+        AllowedPinDirection = GetCellValue(CurrentRow, GetCol(RANGE_ALLOWED_PIN_DIRECTION_SFIO0))
+    ElseIf SelectedCustomerUsage = GetCellValue(CurrentRow, GetCol(RANGE_PINMUX_SFIO1)) Then
+        AllowedPinDirection = GetCellValue(CurrentRow, GetCol(RANGE_ALLOWED_PIN_DIRECTION_SFIO1))
+    ElseIf SelectedCustomerUsage = GetCellValue(CurrentRow, GetCol(RANGE_PINMUX_SFIO2)) Then
+        AllowedPinDirection = GetCellValue(CurrentRow, GetCol(RANGE_ALLOWED_PIN_DIRECTION_SFIO2))
+    ElseIf SelectedCustomerUsage = GetCellValue(CurrentRow, GetCol(RANGE_PINMUX_SFIO3)) Then
+        AllowedPinDirection = GetCellValue(CurrentRow, GetCol(RANGE_ALLOWED_PIN_DIRECTION_SFIO3))
+    End If
+        
+    If AllowedPinDirection = "I" And SelectedPinDirection <> "Input" Then
+        IsPinDirectionValid = False
+        MsgBox ("Error: " & SelectedCustomerUsage & " should not be set as " & SelectedPinDirection & ".")
+    ElseIf AllowedPinDirection = "O" And SelectedPinDirection <> "Output" Then
+        IsPinDirectionValid = False
+        MsgBox ("Error: " & SelectedCustomerUsage & " should not be set as " & SelectedPinDirection & ".")
+    Else
+        IsPinDirectionValid = True
+    End If
+End Function
+
+Function IsCustomerUsageNotBlank(ByVal CurrentRow As Long) As Boolean
+    Dim val As String
+    val = GetCellValue(CurrentRow, GetCol(RANGE_CUSTOMER_USAGE))
+    If val = "" Then
+        MsgBox ("Error: Customer Usage cannot be blank")
+        IsCustomerUsageNotBlank = False
+    Else
+        IsCustomerUsageNotBlank = True
+    End If
+End Function
+
+Function IsResistorConfigurationGood(ByVal CurrentRow As Long) As Boolean
+    Dim SelectedInitialState As String
+    Dim SelectedExtPU As String
+    Dim SelectedExtPD As String
+
+    SelectedInitialState = GetCellValue(CurrentRow, GetCol(RANGE_INITIAL_STATE))
+    SelectedExtPU        = GetCellValue(CurrentRow, GetCol(RANGE_EXT_PU))
+    SelectedExtPD        = GetCellValue(CurrentRow, GetCol(RANGE_EXT_PD))
+    
+    If SelectedInitialState = "Int PU" And SelectedExtPU <> "" Then
+        MsgBox ("Error: Internal pull up cannot be enabled if there is an external pull up.")
+        IsResistorConfigurationGood = False
+    ElseIf SelectedInitialState = "Int PU" And SelectedExtPD <> "" Then
+        MsgBox ("Error: Internal pull up cannot be enabled if there is an external pull down.")
+        IsResistorConfigurationGood = False
+    ElseIf SelectedInitialState = "Int PD" And SelectedExtPU <> "" Then
+        MsgBox ("Error: Internal pull down cannot be enabled if there is an external pull up.")
+        IsResistorConfigurationGood = False
+    ElseIf SelectedInitialState = "Int PD" And SelectedExtPD <> "" Then
+        MsgBox ("Error: Internal pull down cannot be enabled if there is an external pull down.")
+        IsResistorConfigurationGood = False
+    Else
+        IsResistorConfigurationGood = True
+    End If
+End Function
+
+Function IsInitialStateValid(ByVal CurrentRow As Long) As Boolean
+    Dim SelectedCustomerUsage As String
+    Dim SelectedInitialState As String
+
+    SelectedCustomerUsage = GetCellValue(CurrentRow, GetCol(RANGE_CUSTOMER_USAGE))
+    SelectedInitialState  = GetCellValue(CurrentRow, GetCol(RANGE_INITIAL_STATE))
+
+    If Left(SelectedCustomerUsage, 7) = "unused_" And SelectedInitialState <> "" And SelectedInitialState <> "Z" And SelectedInitialState <> "N/A" Then
+        MsgBox "Error: Initial State for an Unused Pin cannot be assigned to " & SelectedInitialState & "."
+        IsInitialStateValid = False
+    Else
+        IsInitialStateValid = True
+    End If
+End Function
+
+Function IsWakeValid(ByVal CurrentRow As Long) As Boolean
+    Dim SelectedWakePin As String
+    Dim SelectedPinDirection As String
+    Dim SelectedCustomerUsage As String
+
+    IsWakeValid = True
+    SelectedWakePin      = GetCellValue(CurrentRow, GetCol(RANGE_WAKE_PIN))
+    SelectedPinDirection = GetCellValue(CurrentRow, GetCol(RANGE_PIN_DIRECTION))
+    SelectedCustomerUsage= GetCellValue(CurrentRow, GetCol(RANGE_CUSTOMER_USAGE))
+    
+    If SelectedWakePin = "" Then Exit Function
+    
+    If SelectedWakePin = "Yes" And Left(SelectedCustomerUsage, 7) = "unused_" Then
+        MsgBox ("Error: Wake cannot be enabled on an Unused Pin")
+        IsWakeValid = False
+    End If
+    
+    If SelectedWakePin = "Yes" And SelectedPinDirection = "Output" Then
+        MsgBox ("Error: Wake cannot be enabled on an Output")
+        IsWakeValid = False
+    ElseIf SelectedWakePin = "Yes" And SelectedPinDirection = "Not Assigned" Then
+        MsgBox ("Error: Wake cannot be enabled on an Unassigned pin")
+        IsWakeValid = False
+    End If
+End Function
+
+Function IsRCVSELValid(ByVal CurrentRow As Long) As Boolean
+    Dim SelectedRCVSEL As String
+    Dim SelectedCustomerUsage As String
+
+    IsRCVSELValid = True
+    SelectedRCVSEL        = GetCellValue(CurrentRow, GetCol(RANGE_RCV_SEL))
+    SelectedCustomerUsage = GetCellValue(CurrentRow, GetCol(RANGE_CUSTOMER_USAGE))
+    
+    If SelectedRCVSEL = "" Then Exit Function
+    
+    If SelectedRCVSEL = "Enable" And Left(SelectedCustomerUsage, 7) = "unused_" Then
+        MsgBox ("Error: 3.3V Tolerance cannot be enabled on an Unused Pin")
+        IsRCVSELValid = False
+    End If
+End Function

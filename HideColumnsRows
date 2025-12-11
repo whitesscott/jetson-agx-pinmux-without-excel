@@ -1,0 +1,167 @@
+REM  ***** BASIC  *****
+Option VBASupport 1
+Option Explicit
+
+' Hide/show columns and rows so the Calc view matches the original
+' Jetson_Thor_Series_Modules_Pinmux_Template_v1.4.xlsm layout.
+'
+' Visible columns (1-based Excel letters):
+'   A-D; AB; AD; AE; AS; AT; AU; AV; AX; BD-BI; BK; BN
+'
+' Hidden rows (1-based Excel rows):
+'   11-12,19,22-24,43-56,85-87,90-92,94-99,101-124,
+'   128-130,133-135,137-139,222,224-236,261-271,
+'   283-285,302,312,332,480-1102
+
+Sub ThorMatchExcelLayout()
+    Dim oDoc As Object
+    Dim oSheet As Object
+    Dim oCols As Object
+    Dim oRows As Object
+    Dim i As Long
+    Dim maxCol As Long
+    Dim maxRow As Long
+
+    oDoc = ThisComponent
+    If oDoc Is Nothing Then
+        MsgBox "No document is active.", 16, "Thor Layout"
+        Exit Sub
+    End If
+
+    On Error GoTo FailHard
+
+    oSheet = oDoc.CurrentController.ActiveSheet
+    oCols = oSheet.Columns
+    oRows = oSheet.Rows
+
+    maxCol = oCols.getCount() - 1
+    If maxCol < 0 Then GoTo Done
+    ' We only care up to BN (index 65). Clamp if there are more.
+    If maxCol > 65 Then maxCol = 65
+
+    maxRow = oRows.getCount() - 1
+    If maxRow < 0 Then GoTo Done
+    ' We only care up to row 1102 (index 1101). Clamp if there are more.
+    If maxRow > 1101 Then maxRow = 1101
+
+    On Error Resume Next
+
+    '-----------------------------------------------------------------
+    ' 1) Unhide working window
+    '-----------------------------------------------------------------
+    For i = 0 To maxCol
+        oCols.getByIndex(i).IsVisible = True
+    Next i
+
+    For i = 0 To maxRow
+        oRows.getByIndex(i).IsVisible = True
+    Next i
+
+    '-----------------------------------------------------------------
+    ' 2) Hide all columns in window, then re-show only the visible set
+    '-----------------------------------------------------------------
+    For i = 0 To maxCol
+        oCols.getByIndex(i).IsVisible = False
+    Next i
+
+    ' Visible column indices (0-based):
+    '   A=0,B=1,C=2,D=3,
+    '   AB=27, AD=29, AE=30,
+    '   AS=44, AT=45, AU=46, AV=47, AX=49,
+    '   BD=55..BI=60,
+    '   BK=62, BN=65
+    Dim visCols(0 To 19) As Long
+
+    visCols(0)  = 0   ' A
+    visCols(1)  = 1   ' B
+    visCols(2)  = 2   ' C
+    visCols(3)  = 3   ' D
+    visCols(4)  = 27  ' AB
+    visCols(5)  = 29  ' AD
+    visCols(6)  = 30  ' AE
+    visCols(7)  = 44  ' AS
+    visCols(8)  = 45  ' AT
+    visCols(9)  = 46  ' AU
+    visCols(10) = 47  ' AV
+    visCols(11) = 49  ' AX
+    visCols(12) = 55  ' BD
+    visCols(13) = 56  ' BE
+    visCols(14) = 57  ' BF
+    visCols(15) = 58  ' BG
+    visCols(16) = 59  ' BH
+    visCols(17) = 60  ' BI
+    visCols(18) = 62  ' BK
+    visCols(19) = 65  ' BN
+
+    For i = LBound(visCols) To UBound(visCols)
+        If visCols(i) <= maxCol Then
+            oCols.getByIndex(visCols(i)).IsVisible = True
+        End If
+    Next i
+
+    '-----------------------------------------------------------------
+    ' 3) Hide specific row ranges (1-based → index-1)
+    '-----------------------------------------------------------------
+    Dim rs() As Long, re() As Long
+    ReDim rs(0 To 18)
+    ReDim re(0 To 18)
+
+    ' 0: 11-12
+    rs(0) = 11:  re(0) = 12
+    ' 1: 19-19
+    rs(1) = 19:  re(1) = 19
+    ' 2: 22-24
+    rs(2) = 22:  re(2) = 24
+    ' 3: 43-56
+    rs(3) = 43:  re(3) = 56
+    ' 4: 85-87
+    rs(4) = 85:  re(4) = 87
+    ' 5: 90-92
+    rs(5) = 90:  re(5) = 92
+    ' 6: 94-99
+    rs(6) = 94:  re(6) = 99
+    ' 7: 101-124
+    rs(7) = 101: re(7) = 124
+    ' 8: 128-130
+    rs(8) = 128: re(8) = 130
+    ' 9: 133-135
+    rs(9) = 133: re(9) = 135
+    ' 10: 137-139
+    rs(10) = 137: re(10) = 139
+    ' 11: 222-222
+    rs(11) = 222: re(11) = 222
+    ' 12: 224-236
+    rs(12) = 224: re(12) = 236
+    ' 13: 261-271
+    rs(13) = 261: re(13) = 271
+    ' 14: 283-285
+    rs(14) = 283: re(14) = 285
+    ' 15: 302-302
+    rs(15) = 302: re(15) = 302
+    ' 16: 312-312
+    rs(16) = 312: re(16) = 312
+    ' 17: 332-332
+    rs(17) = 332: re(17) = 332
+    ' 18: 480-1102
+    rs(18) = 480: re(18) = 1102
+
+    Dim k As Long, r As Long, idx As Long
+    For k = LBound(rs) To UBound(rs)
+        For r = rs(k) To re(k)
+            idx = r - 1   ' convert 1-based row number to 0-based index
+            If idx >= 0 And idx <= maxRow Then
+                oRows.getByIndex(idx).IsVisible = False
+            End If
+        Next r
+    Next k
+
+    On Error GoTo 0
+
+Done:
+    MsgBox "Columns and rows have been adjusted to match the Excel Thor layout.", _
+           64, "Thor Layout"
+    Exit Sub
+
+FailHard:
+    MsgBox "Error while adjusting Thor layout: " & Err & " - " & Error$, 16, "Thor Layout"
+End Sub
